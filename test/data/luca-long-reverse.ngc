@@ -1,0 +1,22 @@
+G64
+G0 X500 Y500 Z100
+G0 X0Y0Z0
+G0 Z-10
+G1F100 Z-20
+G64
+F10000
+#1=0
+#<loops> = 3
+G64
+o<loop> while [#1 LT #<loops>]
+  #1 = [#1 + 1]
+  G90 G1 X200
+  G91 G1 Y0.5
+  G90 G1 X0
+  G91 G1 Y0.5
+o<loop> endwhile
+
+
+G64
+
+m2

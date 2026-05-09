@@ -1,0 +1,7 @@
+test_arc_fit
+test_bezier_fit
+test_rbezier
+test_fuzz
+test_ngc_replay
+test_benchmark
+*.o
