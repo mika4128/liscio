@@ -89,28 +89,38 @@ Examples:
 - **Out-of-plane arc (tilted plane)**: currently falls back to G1 resampling.
   Rare.
 
-### Measurement (16 CAM files, tol=0.05) — portable vs linuxcnc
+### Measurement (18 CAM files, tol=0.05, default cfg with helix9 LSQ on)
 
-| File | Input | portable | linuxcnc (G5) | p_x | **l_x** |
-|---|---:|---:|---:|---:|---:|
-| **1_1001** | 502 KB | 308 KB | **107 KB** | 1.63× | **4.68×** ✅ |
-| 2_1001 | 19.8 KB | 11.9 KB | **9.06 KB** | 1.66× | 2.18× |
-| 3_1001 | 352 KB | 188 KB | **177 KB** | 1.87× | 1.99× |
-| 4_1001 | 134 KB | 71.6 KB | 71.6 KB | 1.88× | 1.88× |
-| 5_1001 | 307 KB | 178 KB | **168 KB** | 1.72× | 1.82× |
-| 6_1001 | 141 KB | 82.1 KB | 82.1 KB | 1.71× | 1.71× |
-| bto45 | 533 B | 131 B | 131 B | 4.07× | 4.07× |
-| **sine_test** | 8.85 KB | 4.83 KB | **0.99 KB** | 1.83× | **8.93×** ✅ |
-| **flower** | 733 KB | 1243 KB | 1243 KB | 0.59× | 0.59× ❌ (3D) |
-| thomam | 8.77 KB | 11.3 KB | 11.3 KB | 0.78× | 0.78× |
-| rechteck/yy/luca | ≤213 B | ≤442 B | ≤442 B | <1× | <1× |
+`portable` mode file-size compression (helix9 default ON, reused):
 
-**linuxcnc mode incremental gain**:
-- sine_test 1.83× → **8.93×** (5× more compression)
-- 1_1001 1.63× → **4.68×** (3× more compression)
-- 2D BEZIER-dense files (sine, 1_1001, 2_1001, ...) benefit greatly
-- 3D BEZIER (flower, 4_1001, 6_1001) no benefit — G5 is XY-plane only
-- ARC-dominated files (thomam) unchanged
+| File | Input | Output | Ratio | Note |
+|---|---:|---:|---:|---|
+| bto45 | 533 B | 131 B | **4.07×** | 16 G1 → 1 LINE |
+| **thomam** | 8.77 KB | 4.47 KB | **1.96×** ✅ | helix9 folds 11 HELIX, big improvement |
+| 3_1001 | 352 KB | 188 KB | 1.87× | |
+| 4_1001 | 134 KB | 71.8 KB | 1.87× | |
+| sine_test | 8.85 KB | 4.83 KB | 1.83× | 17 BEZIER |
+| 5_1001 | 307 KB | 178 KB | 1.72× | |
+| 6_1001 | 141 KB | 82.5 KB | 1.70× | |
+| 2_1001 | 19.8 KB | 12.0 KB | 1.65× | |
+| 1_1001 | 502 KB | 308 KB | 1.63× | |
+| 130207LZW | 130 KB | 82.9 KB | 1.57× | |
+| SER-40 | 553 KB | 402 KB | 1.38× | engraved text |
+| luca-long-reverse | 213 B | 189 B | 1.13× | |
+| flower-one-line | 3.76 KB | 3.68 KB | 1.02× | BEZIER resample ≈ wash |
+| rechteck-10x10 | 161 B | 282 B | 0.57× ❌ | already minimal G1, no room |
+| **flower** | 733 KB | 1243 KB | 0.59× ❌ | 3D BEZIER resample inflates |
+
+> **thomam improvement** (vs earlier doc 0.78× inflation): helix9 LSQ
+> auto-detection folds 245 G3 arcs into 11 HELIX primitives emitted
+> as G2/G3 P\<turns\> multi-turn form, halving the file.  Earlier
+> ARC-passthrough mode rewrote each arc in full IJK form, inflating.
+
+`--target=linuxcnc` incremental gain (XY-plane BEZIER → G5):
+- **sine_test** 1.83× → **8.93×** (BEZIER → single G5)
+- **1_1001** 1.63× → **4.68×** (lots of 2D BEZIER)
+- No change for 3D BEZIER (flower, 4/6_1001) / ARC-dominated /
+  corner-rich files
 
 **Summary**:
 | Data characteristic | Recommended mode |

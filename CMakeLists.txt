@@ -122,6 +122,22 @@ if(BUILD_TESTS)
     add_test(NAME fuzz        COMMAND test_fuzz 1 30 200)
     add_test(NAME arc_merge   COMMAND test_arc_merge)
 
+    # liscio_compress round-trip: re-fit the compressed output and gate
+    # against tol_xyz.  If the compressed NGC drifts beyond tolerance the
+    # tool has lied about preserving geometry, regardless of file size.
+    if(BUILD_TOOLS)
+        add_test(NAME compress_roundtrip
+            COMMAND bash -c "
+                set -e
+                T=$(mktemp /tmp/liscio_rt_XXXXXX.ngc)
+                trap 'rm -f $T' EXIT
+                $<TARGET_FILE:liscio_compress> --tol_xyz=0.05 \
+                    --output=$T \
+                    ${CMAKE_CURRENT_SOURCE_DIR}/test/data/thomam.ngc
+                $<TARGET_FILE:test_verify> --tol_xyz=0.10 $T
+            ")
+    endif()
+
     # Geometric regression gate: no fit may exceed tol_xyz against any raw
     # waypoint, AND no fit polyline may drift to > 1.5× its absorbed-chord
     # length.  Catches both pointwise miss and inter-waypoint drift.

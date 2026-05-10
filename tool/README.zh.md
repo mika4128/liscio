@@ -1,5 +1,3 @@
-[English](README.md) | **中文**
-
 # liscio 工具集
 
 > 用户面向工具 (`BUILD_TOOLS=ON`).  跟 `test/` 目录的回归 / 基准不同, 这些
@@ -86,28 +84,36 @@ Examples:
   压缩后的 NGC 是 absolute mm 形式, 不能回到原坐标系.
 - **平面外弧 (tilted plane)**: 当前回退为 G1 重采样. 极少见.
 
-### 实测 (16 CAM 文件, tol=0.05) — portable vs linuxcnc 对比
+### 实测 (18 CAM 文件, tol=0.05, default cfg with helix9 LSQ on)
 
-| 文件 | 输入 | portable | linuxcnc (G5) | p_x | **l_x** |
-|---|---:|---:|---:|---:|---:|
-| **1_1001** | 502 KB | 308 KB | **107 KB** | 1.63× | **4.68×** ✅ |
-| 2_1001 | 19.8 KB | 11.9 KB | **9.06 KB** | 1.66× | 2.18× |
-| 3_1001 | 352 KB | 188 KB | **177 KB** | 1.87× | 1.99× |
-| 4_1001 | 134 KB | 71.6 KB | 71.6 KB | 1.88× | 1.88× |
-| 5_1001 | 307 KB | 178 KB | **168 KB** | 1.72× | 1.82× |
-| 6_1001 | 141 KB | 82.1 KB | 82.1 KB | 1.71× | 1.71× |
-| bto45 | 533 B | 131 B | 131 B | 4.07× | 4.07× |
-| **sine_test** | 8.85 KB | 4.83 KB | **0.99 KB** | 1.83× | **8.93×** ✅ |
-| **flower** | 733 KB | 1243 KB | 1243 KB | 0.59× | 0.59× ❌ (3D) |
-| thomam | 8.77 KB | 11.3 KB | 11.3 KB | 0.78× | 0.78× |
-| rechteck/yy/luca | ≤213 B | ≤442 B | ≤442 B | <1× | <1× |
+`portable` mode 文件大小压缩 (helix9 默认开启, 复用此功能):
 
-**linuxcnc 模式增量收益**:
-- sine_test 1.83× → **8.93×** (5× more compression)
-- 1_1001 1.63× → **4.68×** (3× more compression)
-- 2D BEZIER 密集文件 (sine, 1_1001, 2_1001 等) 大幅受益
-- 3D BEZIER (flower, 4_1001, 6_1001) 不受益 — G5 仅 XY 平面
-- 已是 ARC 主导的文件 (thomam) 无变化
+| 文件 | 输入 | 输出 | 压缩比 | 说明 |
+|---|---:|---:|---:|---|
+| bto45 | 533 B | 131 B | **4.07×** | 16 G1 → 1 LINE |
+| **thomam** | 8.77 KB | 4.47 KB | **1.96×** ✅ | helix9 fold 11 HELIX, 大幅改善 |
+| 3_1001 | 352 KB | 188 KB | 1.87× | |
+| 4_1001 | 134 KB | 71.8 KB | 1.87× | |
+| sine_test | 8.85 KB | 4.83 KB | 1.83× | 17 BEZIER |
+| 5_1001 | 307 KB | 178 KB | 1.72× | |
+| 6_1001 | 141 KB | 82.5 KB | 1.70× | |
+| 2_1001 | 19.8 KB | 12.0 KB | 1.65× | |
+| 1_1001 | 502 KB | 308 KB | 1.63× | |
+| 130207LZW | 130 KB | 82.9 KB | 1.57× | |
+| SER-40 | 553 KB | 402 KB | 1.38× | 雕刻文字 |
+| luca-long-reverse | 213 B | 189 B | 1.13× | |
+| flower-one-line | 3.76 KB | 3.68 KB | 1.02× | BEZIER 重采样 ≈ 持平 |
+| rechteck-10x10 | 161 B | 282 B | 0.57× ❌ | 已是 G1 矩形, 无空间 |
+| **flower** | 733 KB | 1243 KB | 0.59× ❌ | 3D BEZIER 重采样反膨胀 |
+
+> **thomam 改善** (vs 早期文档 0.78× 反膨胀): helix9 LSQ 自动检测让
+> 245 个 G3 弧 fold 成 11 个 HELIX (G2/G3 P\<turns\> 多 turn form),
+> 文件大小近半. 早期 ARC 直通模式每弧重写为完整 IJK-form 故膨胀.
+
+`--target=linuxcnc` 增量收益 (XY-plane BEZIER 用 G5 emit):
+- **sine_test** 1.83× → **8.93×** (BEZIER → 单 G5)
+- **1_1001** 1.63× → **4.68×** (大量 2D BEZIER)
+- 3D BEZIER (flower, 4/6_1001) / ARC 主导 / 角点密集 文件无变化
 
 **总结**:
 | 数据特征 | 推荐模式 |
