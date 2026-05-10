@@ -43,7 +43,7 @@
 ```c
 liscio_cfg_t cfg;
 liscio_cfg_default(&cfg);
-cfg.tol_xyz            = 0.01;     /* 10 µm — 工业主流 sweet spot */
+cfg.tol_xyz            = 0.01;     /* 10 µm — 金属切削常用值 */
 cfg.tol_abc            = 0.1;      /* 0.1° — 旋转轴 */
 cfg.arc_subseg_samples = 0;        /* G2/G3 直通, 几何无损 (默认) */
 liscio_ctx_t *ctx = liscio_create(&cfg);
@@ -58,25 +58,30 @@ liscio_ctx_t *ctx = liscio_create(&cfg);
 | 木工 / 塑料 / 3D 打印 | 0.05 mm | 7.49× | CAM 默认下限 |
 | **金属切削主流** | **0.01 mm** | **4.43×** | **推荐默认 ✅** |
 | 模具 / 光学 / 半导体 | 1e-3 mm | 2.02× | 超精密 |
-| 形位公差零容忍 | ≤1e-4 mm | ≈ 1.4× | 接近 passthrough |
+| 形位公差零容忍 | ≤1e-4 mm | ≈ 1.4× | 几乎不压缩, 原样输出 |
 
-> liscio 在双精度浮点底线 `1e-8 mm` 仍跑得动, 无性能惩罚. 紧公差时压缩
-> 比逼近 1.40× 渐近线 (≈ 几何 passthrough). 详见
+> 即使把容差打到双精度浮点的极限 (`1e-8 mm`) 也能跑, 不会变慢. 容差越紧,
+> 压缩比越接近 1.40× 的下限 — 等同 "原样直通". 
 
-### G2/G3 处理: **直通** (`arc_subseg_samples = 0`)
+### G2/G3 圆弧的处理: **直通** (`arc_subseg_samples = 0`)
 
-CAM 的 G2/G3 弧调 `liscio_add_arc()` 直接通过 → emit `LISCIO_PRIM_ARC`,
-**max_dev = 0 几何无损**. 下游 TP 拿解析弧公式做 jerk 规划比沿 Bezier
-数值积分快得多.
+CAM 输出的 G2/G3 弧 (圆弧/螺旋) 通过 `liscio_add_arc()` 喂进 liscio,
+**几何精确不动**地输出成 `LISCIO_PRIM_ARC` 原语 (max_dev = 0). 下游
+轨迹规划器拿到解析的圆弧公式后, 做加加速度 (jerk) 受限速度规划比按
+贝塞尔曲线数值积分快得多.
 
-`arc_subseg_samples > 0` (切分模式) 仅在三个条件**同时**成立时才打开:
-1. CAM 输出大量短弧 (例如 biarc fillet)
-2. 工件公差 ≥ 10 µm
-3. 下游 TP buffer 紧张, 需减 prim 数
+`arc_subseg_samples > 0` 是把每条 G2/G3 切成 N 段直线再喂进 G1 LSQ
+管线, 让相邻弧能跟附近 G1 一起 fold 成更长的 BEZIER. 仅当下面三条
+**同时**满足时才有意义:
 
-实测: 紧公差下切分模式**反向膨胀**最高 5×.  默认 0 是工业最优.
+1. CAM 输出有大量短弧 (例如倒圆角的 biarc fillet)
+2. 工件公差 ≥ 10 µm (容许 chord 误差)
+3. 下游规划器输入队列吃紧, 需要更少原语数
 
-### 进阶: 邻接弧合并 + HELIX 原语 (opt-in)
+实测: 容差紧时切分会**反向膨胀**最高 5× (一条弧变 8 条直线就完了).
+所以默认 `0` 直通才是工业最优解.
+
+### 进阶: 相邻同心弧合并成 HELIX (默认关)
 
 ```c
 liscio_cfg_set_arc_merge(&cfg, LISCIO_ARC_MERGE_HELIX, 0, 0);
@@ -87,30 +92,38 @@ arc_angle > 2π).  几何无损. 用户场景:
 
 | 适用 | 不适用 |
 |---|---|
-| 用户手写 G-code 多段同心圆 | CAM chord-approximation 弦近似 |
-| 螺纹加工 (lathe G33) | 自由曲面切削 |
-| 同心多层钻孔 | 螺旋壁加工 (R 递减) |
+| 手写 G-code, 几条圆弧严格同心 | CAM 用很多小弧近似一条曲线 |
+| 车床螺纹加工 (G33) | 自由曲面铣削 |
+| 同心多层钻孔 | 螺旋壁 (半径每圈递减) |
 
-### 进阶: Look-ahead corner 决策 (opt-in)
+默认关, 不影响主流路径.
+> CAM 弦近似的螺旋请用默认开启的 `arc_to_helix_max` 走 LSQ 路径
+> 它对浮点不严格
+> 同心也能识别.
+
+### 进阶: 让"看起来是软角的"不切分 (默认关)
 
 ```c
 liscio_cfg_set_corner_detection(&cfg, LISCIO_CORNER_LOOKAHEAD,
                                  15.0 /*soft°*/, 60.0 /*hard°*/);
 ```
 
-把"角度判断"和"是否 split"解耦, 两级阈值:
-- **软角** (15-60°): 不立即 split, 让 Bezier G1 fit 吸收 → 切向连续性大幅提升
-- **硬角** (>60°): 立即 split (保 corner 意图)
+两级角度阈值, 把 "判断是不是角点" 跟 "要不要切分" 解耦:
+- **软角** (15-60°): 不切, 让 BEZIER 拟合带住, 输出曲线切向更平滑
+- **硬角** (>60°): 立即切 (这是真正的角点, 保留)
 
-实测 (16 文件 tol=0.05): 加权 tan_mean **20.4° → 14.4° (-30%)**, 代价
-压缩比 7.49× → 6.05× (-19%). 受益最大 flower (-40%) / flower-one-line (-55%).
+实测 (16 文件 tol=0.05): 切向失配 (相邻原语接缝处) 加权平均
+**20.4° → 14.4° (-30%)**, 代价压缩比 7.49× → 6.05× (-19%). flower
+(-40%) / flower-one-line (-55%) 受益最大.
 
-适用: 下游做 **G64 blend** 时, 把 jerk-limited 速度规划给得更平滑.
-不适用: G61 精准停 + prim count 紧张. 默认仍 IMMEDIATE.
+什么时候开: 下游用 G64 blend (圆滑过渡) 做 jerk-limited 速度规划时,
+开 lookahead 让规划更平滑. 不要开: G61 精准停 + 原语数预算紧时,
+保持默认每个角点都切.
 
-### G-code 事件流: RAPID + STOP 直通
+### G-code 事件流: G0 / 停顿 / 换刀 也直通
 
-liscio 输出 = 完整 G-code 事件流, 不只切削原语.  非切削事件**专用 API**:
+liscio 输出**不只是切削原语**, 完整的 G-code 事件流都会出. 非切削事件
+有**专门 API**:
 
 ```c
 liscio_add_rapid(ctx, &start, &end, line);                   /* G0 */
@@ -119,18 +132,17 @@ liscio_emit_stop(ctx, LISCIO_STOP_TOOL_CHANGE, 0, NULL, line); /* M6 */
 liscio_emit_stop(ctx, LISCIO_STOP_PROGRAM_END, 0, NULL, line); /* M2/M30 */
 ```
 
-输出 `LISCIO_PRIM_RAPID` / `LISCIO_PRIM_STOP` 原语, 下游 TP 单一入口
-(`on_prim`) 按 `p->type` 分发: 切削原语进 jerk-limited 队列, RAPID 走
-max-velocity, STOP 按 `p->stop_reason` 处理.
-
-完整 LinuxCNC canon (STRAIGHT_FEED/STRAIGHT_TRAVERSE/DWELL/CHANGE_TOOL/
-SET_ORIGIN_OFFSETS/...) → liscio API 映射表见
+这些会 emit 成 `LISCIO_PRIM_RAPID` / `LISCIO_PRIM_STOP` 类型的原语.
+下游规划器只用一个回调 `on_prim` 接所有原语, 按 `p->type` 分流处理:
+- 切削原语 → 进 jerk-limited 速度规划队列
+- RAPID (G0) → 走最大空程速度
+- STOP → 按 `p->stop_reason` (停顿/换刀/程序结束/坐标系切换) 处理
 
 ### 完整推荐配置流程图
 
 ```
 你的 G64 P 是多少?
-  ├─ 没设 ──────────────→ tol_xyz = 0.01 (LinuxCNC 默认 sweet spot)
+  ├─ 没设 ──────────────→ tol_xyz = 0.01 (LinuxCNC 默认推荐值)
   ├─ 0.05 (木工/塑料) ──→ tol_xyz = 0.05
   ├─ 0.01 (金属主流) ──→ tol_xyz = 0.01
   └─ 0.001 (模具) ─────→ tol_xyz = 0.001

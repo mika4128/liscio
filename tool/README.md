@@ -2,8 +2,10 @@
 
 # liscio tools
 
-> User-facing tools (`BUILD_TOOLS=ON`). Different from `test/` regression /
-> benchmarks; these are for production.
+> Command-line programs **for end users** — distinct from the dev-side
+> regression / benchmark binaries under `test/`.  These ship into a
+> machine post-processing pipeline.  Built by default; disable with
+> `-DBUILD_TOOLS=OFF` to cmake.
 
 ## liscio_compress — G-code → G-code compressor
 
@@ -28,17 +30,23 @@ G3 X20 Y0 R10                   M2
 ./build/liscio_compress [options] <input.ngc>
 
 Options:
-  --tol_xyz=N        XYZ fit tolerance mm (default 0.01 = 10µm sweet spot)
-  --output=PATH      output file (default stdout)
-  --precision=N      G-code numeric decimals (default 5)
-  --arc_merge=N      G2/G3 merge: 0=off 1=ARC 2=HELIX (default 2)
-  --corner_mode=N    Corner detection: 0=IMMEDIATE 1=LOOKAHEAD (default 0)
-  --bezier_samples=N BEZIER/SPLINE resampled to N G1 (default 16)
-  --portable         Split helical multi-turn into multiple single-turn G2/G3
-                      (no P<turns>); default uses LinuxCNC P form (more compact)
+  --tol_xyz=N        XYZ geometric tolerance in mm (default 0.01 = 10 µm,
+                      the typical metal-cutting setting)
+  --output=PATH      output file path (default: write to stdout)
+  --precision=N      decimal places used for coordinates in the output (default 5)
+  --arc_merge=N      adjacent G2/G3 fold:  0=off  1=merge into single ARC
+                      2=detect HELIX (default — multi-turn helices auto-fold)
+  --corner_mode=N    corner handling: 0=split immediately on any corner (default)
+                                      1=look-ahead, soft corners absorbed into BEZIER
+  --bezier_samples=N each BEZIER resampled to N G1 lines on output (default 8)
+                      (LinuxCNC mode prefers G5; this only kicks in on the
+                       portable fallback path)
+  --portable         emit one G2/G3 per turn for helices (no P<turns>);
+                      default is LinuxCNC's compact P form
   --target=MODE      portable (default) / linuxcnc
-                      linuxcnc mode: XY-planar BEZIER emitted as G5 cubic Bezier
-                                     (significantly reduces BEZIER-dense files; see table)
+                      linuxcnc mode: emit BEZIER as native G5 cubic Bezier in
+                                     any of the G17/G18/G19 planes (XY/XZ/YZ);
+                                     much smaller than G1 resample, see table.
 
 Examples:
   # Standard usage (LinuxCNC + default precision)
@@ -74,20 +82,28 @@ Examples:
 
 #### Known limitations
 
-- **portable mode BEZIER → G1 resample**: standard G-code has no native Bezier.
-  For BEZIER-dense 2D inputs, output inflates. Solution:
-  → `--target=linuxcnc` enables G5 emit (XY-plane Bezier directly G5 output;
-    measured sine file 1.83× → **8.93×**).
-- **`--target=linuxcnc` only for XY-plane Bezier**: G5 G-code standard supports
-  only X/Y axes; 3D Bezier with Z variation (e.g. flower) still falls back to
-  G1 resampling. 9D rotary/UVW also fall back. For full 9D, the better path is
-  to integrate liscio API directly (bypassing G-code).
-- **G92/G10/G43/G49 offset events**: currently emitted as comment placeholders,
-  no coordinate-system restoration (because ngc_parser already converted all
-  coordinates to absolute mm via rs274). Note: compressed NGC is in absolute
-  mm form, cannot return to original coordinate system.
-- **Out-of-plane arc (tilted plane)**: currently falls back to G1 resampling.
-  Rare.
+- **portable mode: BEZIER must be resampled to G1**.
+  Standard G-code has no native cubic Bezier opcode (G2/G3 = arcs, G1 =
+  lines).  Cross-controller output therefore breaks each BEZIER into
+  several short G1 lines, which can inflate the file on BEZIER-dense
+  2D inputs.  Fix: use `--target=linuxcnc` to emit G5 (see below).
+
+- **`--target=linuxcnc` constraints**: G5 is LinuxCNC's native cubic
+  Bezier opcode; it works in any of the three cardinal planes
+  (G17 XY / G18 XZ / G19 YZ).  Tilted-plane (truly 3D) BEZIER and any
+  curve with rotary or UVW motion still fall back to G1 resample.
+  If you need to keep full 9D geometry, integrate the liscio API
+  directly rather than going through G-code.
+
+- **Coordinate-shift opcodes (G92/G10/G43/G49) become comments**.
+  By the time rs274 has parsed the input, every coordinate is in
+  absolute millimetres, so these "change-coordinate-system" opcodes
+  no longer affect anything.  The tool keeps them as comments to
+  preserve line numbering only.  Note: the output is absolute-mm
+  G-code; you cannot get back to the original coordinate system.
+
+- **Out-of-plane arcs** (normal not aligned with X/Y/Z): currently
+  fall back to G1 resample.  Vanishingly rare in CAM data.
 
 ### Measurement (18 CAM files, tol=0.05, default cfg, helix9 LSQ on)
 

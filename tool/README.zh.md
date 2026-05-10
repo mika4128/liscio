@@ -1,7 +1,8 @@
 # liscio 工具集
 
-> 用户面向工具 (`BUILD_TOOLS=ON`).  跟 `test/` 目录的回归 / 基准不同, 这些
-> 是给生产环境用的.
+> 这里放的是 **给最终用户跑的命令行程序** — 跟 `test/` 里的开发回归测试
+> 和基准跑分不同, 这些是装到机床 / 后处理流水线上日常用的.
+> 默认编译; 关闭传 `-DBUILD_TOOLS=OFF` 给 cmake.
 
 ## liscio_compress — G-code → G-code 压缩器
 
@@ -25,17 +26,21 @@ G3 X20 Y0 R10                   M2
 ./build/liscio_compress [options] <input.ngc>
 
 Options:
-  --tol_xyz=N        XYZ 拟合容差 mm (默认 0.01 = 10µm 工业 sweet spot)
-  --output=PATH      输出文件 (默认 stdout)
-  --precision=N      G-code 数字小数位 (默认 5)
-  --arc_merge=N      G2/G3 合并: 0=off 1=ARC 2=HELIX (默认 2)
-  --corner_mode=N    Corner 检测: 0=IMMEDIATE 1=LOOKAHEAD (默认 0)
-  --bezier_samples=N BEZIER/SPLINE 重采样为 N 个 G1 (默认 16)
-  --portable         拆 helical 多圈为多个单圈 G2/G3 (无 P<turns>);
-                      默认用 LinuxCNC P 形式 (更紧凑)
+  --tol_xyz=N        XYZ 几何容差 mm (默认 0.01, 即 10 µm — 金属切削常用值)
+  --output=PATH      输出文件路径 (默认写到屏幕)
+  --precision=N      输出 G-code 坐标小数位数 (默认 5 位)
+  --arc_merge=N      相邻 G2/G3 弧合并: 0=不合并  1=合并成 ARC  2=识别 HELIX
+                      (默认 2 — 多 turn 螺旋会自动识别并紧凑输出)
+  --corner_mode=N    角点处理: 0=遇到角点立即切分 (默认)
+                              1=Look-ahead, 软角让 BEZIER 吸收, 硬角才切
+  --bezier_samples=N 把每条 BEZIER 重采样成 N 段 G1 写到输出 (默认 8)
+                      (LinuxCNC 模式下尽量用 G5; 此参数仅 portable 路径用到)
+  --portable         多圈螺旋拆成多个单圈 G2/G3 (没 P<turns>); 默认用
+                     LinuxCNC 的 P 形式更紧凑
   --target=MODE      portable (默认) / linuxcnc
-                      linuxcnc 模式: XY-planar BEZIER 用 G5 cubic Bezier 输出
-                                   (大幅减小 BEZIER-密集文件; 见下表)
+                      linuxcnc 模式: BEZIER 用 G5 输出 (LinuxCNC 原生 cubic
+                                     Bezier, 支持 XY/XZ/YZ 三个平面),
+                                     文件比 G1 重采样小很多, 详见下表
 
 Examples:
   # 标准用法 (LinuxCNC + 默认精度)
@@ -71,18 +76,23 @@ Examples:
 
 #### 已知限制
 
-- **portable 模式 BEZIER → G1 重采样**: 标准 G-code 无原生 Bezier.
-  对 BEZIER-密集 2D 输入, 输出反向膨胀.  解决方案:
-  → `--target=linuxcnc` 启用 G5 emit (XY 平面 Bezier 直接 G5 输出,
-    sine 文件实测 1.83× → **8.93×**).
-- **`--target=linuxcnc` 仅适用于 XY 平面 Bezier**: G5 G-code 标准只
-  支持 X/Y 两轴, 含 Z 变化的 3D Bezier (如 flower) 仍回退 G1 重采样.
-  9D 旋转/UVW 也回退. 对全 9D 表达, 直接接 liscio API (绕过 G-code) 是更
-  好的方案.
-- **G92/G10/G43/G49 偏移事件**: 当前以注释形式占位, 不做坐标系还原
-  (因为 ngc_parser 已用 rs274 把所有坐标转 absolute mm). 用户注意:
-  压缩后的 NGC 是 absolute mm 形式, 不能回到原坐标系.
-- **平面外弧 (tilted plane)**: 当前回退为 G1 重采样. 极少见.
+- **portable 模式: BEZIER 必须重采样成 G1**.
+  标准 G-code 没有原生 cubic Bezier 指令 (G2/G3 只能画圆弧, G1 只能画直线).
+  跨控制器输出时只能把每条 BEZIER 切成多段直线写出来, 对 BEZIER 多的
+  2D 文件可能反向膨胀. 解决: 用 `--target=linuxcnc` 启用 G5 输出 (见下).
+
+- **`--target=linuxcnc` 限制**: G5 是 LinuxCNC 原生 cubic Bezier 指令,
+  支持 G17/G18/G19 三个标准平面 (XY / XZ / YZ); 倾斜平面 (任意 3D) 上的
+  BEZIER 仍只能 G1 重采样. 旋转轴 / UVW 也会 fall back. 如果你需要保留
+  全 9D 几何, 直接调 liscio API 比走 G-code 输出更合适.
+
+- **坐标偏移 (G92/G10/G43/G49) 当注释**: 输入文件被 rs274 解析成绝对
+  毫米坐标后, 这些 "改坐标系" 类指令对位置已无影响. 工具用注释占位
+  保留行号, 不还原原始坐标系. 注意: 压缩后的文件就是绝对毫米形式,
+  不能回到原坐标系.
+
+- **倾斜平面圆弧** (法向不沿 X/Y/Z 轴): 当前 fall back G1 重采样.
+  CAM 数据里极少见.
 
 ### 实测 (18 CAM 文件, tol=0.05, default cfg with helix9 LSQ on)
 

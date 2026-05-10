@@ -43,7 +43,7 @@ For most users, **only `tol_xyz` needs tuning**; keep other fields at defaults.
 ```c
 liscio_cfg_t cfg;
 liscio_cfg_default(&cfg);
-cfg.tol_xyz            = 0.01;     /* 10 µm — industry sweet spot */
+cfg.tol_xyz            = 0.01;     /* 10 µm — typical metal-cutting setting */
 cfg.tol_abc            = 0.1;      /* 0.1° — rotary axes */
 cfg.arc_subseg_samples = 0;        /* G2/G3 passthrough, lossless (default) */
 liscio_ctx_t *ctx = liscio_create(&cfg);
@@ -58,26 +58,35 @@ Match LinuxCNC `[TRAJ] DEFAULT_LINEAR_TOLERANCE` / G-code `G64 P`:
 | Wood / plastic / 3D printing | 0.05 mm | 7.49× | CAM lower bound |
 | **Metal cutting mainstream** | **0.01 mm** | **4.43×** | **Recommended default ✅** |
 | Mold / optics / semiconductor | 1e-3 mm | 2.02× | Ultra-precision |
-| Form-tolerance zero | ≤1e-4 mm | ≈ 1.4× | Near passthrough |
+| Form-tolerance zero | ≤1e-4 mm | ≈ 1.4× | Almost no compression — near-passthrough |
 
-> liscio runs down to double-precision floor `1e-8 mm` with no performance penalty.
-> At tight tolerance, compression ratio approaches the 1.40× asymptote (≈ geometric passthrough).
+> liscio still runs at the double-precision floor `1e-8 mm` with no
+> slowdown.  As you tighten the tolerance, the compression ratio
+> approaches its lower bound (~1.40×), which is essentially "pass
+> the input through unchanged".  
 
-### G2/G3 handling: **passthrough** (`arc_subseg_samples = 0`)
+### G2/G3 arc handling: **passthrough** (`arc_subseg_samples = 0`)
 
-CAM G2/G3 arcs go through `liscio_add_arc()` directly → emit `LISCIO_PRIM_ARC`,
-**max_dev = 0, lossless geometry**. Downstream TP using analytic arc formulas
-for jerk planning is much faster than numerical integration along Bezier.
+A CAM-emitted G2/G3 arc fed through `liscio_add_arc()` is preserved
+**bit-for-bit geometrically** as a `LISCIO_PRIM_ARC` (max_dev = 0).
+Downstream the trajectory planner uses the analytic arc formulas to
+compute jerk-limited velocity profiles — much faster than numerically
+integrating along a Bezier curve.
 
-`arc_subseg_samples > 0` (split mode) only when **all three** conditions hold:
-1. CAM emits many short arcs (e.g. biarc fillet)
-2. Workpiece tolerance ≥ 10 µm
-3. Downstream TP buffer is tight, must reduce primitive count
+Set `arc_subseg_samples > 0` to instead chop each G2/G3 into N short
+G1 lines and feed them to the G1 LSQ pipeline; this lets adjacent
+arcs fold with neighbouring G1 runs into longer BEZIER primitives.
+Only useful when **all three** are true:
 
-Empirical: at tight tolerance, split mode **inflates** up to 5×. Default 0 is
-the industrial optimum.
+1. CAM produces many short arcs (e.g. fillet biarcs)
+2. Workpiece tolerance ≥ 10 µm (chord error is tolerable)
+3. Downstream queue is tight on primitive count
 
-### Advanced: adjacent arc merge + HELIX (opt-in)
+Empirical: at tight tolerance the split mode **inflates** up to 5×
+(one arc → 8 lines).  Default `0` (passthrough) is the right industrial
+choice.
+
+### Advanced: fold adjacent concentric arcs into HELIX (opt-in)
 
 ```c
 liscio_cfg_set_arc_merge(&cfg, LISCIO_ARC_MERGE_HELIX, 0, 0);
@@ -88,31 +97,40 @@ Fold adjacent concentric + same-radius + same-pitch G2/G3 arcs into a single ARC
 
 | Applicable | Not applicable |
 |---|---|
-| Hand-written G-code with concentric arcs | CAM chord-approximation |
-| Thread cutting (lathe G33) | Free-form surface cuts |
-| Multi-layer concentric drilling | Spiral-wall machining (R diminishing) |
+| Hand-written G-code with several truly concentric arcs | CAM that uses many small arcs to approximate one curve |
+| Thread cutting on a lathe (G33) | Free-form surface milling |
+| Multi-layer concentric drilling | Spiral wall (radius shrinks per turn) |
 
-### Advanced: Look-ahead corner decision (opt-in)
+> For CAM chord-approximated helices use the default-on `arc_to_helix_max`
+> LSQ path instead.  
+> It handles centres that drift in the last few floating-point digits.
+
+### Advanced: don't split on "soft" corners (opt-in)
 
 ```c
 liscio_cfg_set_corner_detection(&cfg, LISCIO_CORNER_LOOKAHEAD,
                                  15.0 /*soft°*/, 60.0 /*hard°*/);
 ```
 
-Decouple "angle judgment" from "split-or-not", two thresholds:
-- **Soft corner** (15-60°): don't split immediately, let Bezier G1 fit absorb it → tangent continuity improves significantly
-- **Hard corner** (>60°): split immediately (preserve corner intent)
+Two angle thresholds, separating "is this a corner?" from "do we split?":
+- **Soft corner** (15-60°): don't split — let the BEZIER fit absorb
+  it.  The output curve has a continuous tangent through this region.
+- **Hard corner** (>60°): split immediately, this is a real corner.
 
-Empirical (16 files, tol=0.05): weighted tan_mean **20.4° → 14.4° (-30%)**, cost
-compression ratio 7.49× → 6.05× (-19%). Best gain on flower (-40%) / flower-one-line (-55%).
+Empirical (16 files, tol=0.05): mean tangent mismatch at primitive
+joins drops **20.4° → 14.4° (-30%)**, cost is compression ratio
+7.49× → 6.05× (-19%).  flower (-40%) / flower-one-line (-55%) benefit
+the most.
 
-Applicable: when downstream does **G64 blend**, jerk-limited speed planning becomes smoother.
-Not applicable: G61 exact-stop + tight prim-count budget. Default still IMMEDIATE.
+When to enable: downstream uses G64 blend (smooth corner pass-through)
+and wants smoother jerk-limited velocity profiles.  When **not** to
+enable: G61 exact-stop machining or a tight primitive-count budget —
+keep the default of splitting at every corner.
 
-### G-code event stream: RAPID + STOP passthrough
+### G-code event stream: G0, dwell, tool-change pass through too
 
-liscio output = full G-code event stream, not only cutting primitives. Non-cutting
-events get **dedicated APIs**:
+liscio's output is **the full G-code event stream**, not only cutting
+primitives.  Non-cutting events have dedicated APIs:
 
 ```c
 liscio_add_rapid(ctx, &start, &end, line);                   /* G0 */
@@ -121,18 +139,20 @@ liscio_emit_stop(ctx, LISCIO_STOP_TOOL_CHANGE, 0, NULL, line); /* M6 */
 liscio_emit_stop(ctx, LISCIO_STOP_PROGRAM_END, 0, NULL, line); /* M2/M30 */
 ```
 
-Output `LISCIO_PRIM_RAPID` / `LISCIO_PRIM_STOP` primitives; downstream TP
-single entry (`on_prim`) dispatches by `p->type`: cutting primitives go to
-the jerk-limited queue, RAPID goes max-velocity, STOP handled per `p->stop_reason`.
+These emit as `LISCIO_PRIM_RAPID` / `LISCIO_PRIM_STOP` primitives.
+The downstream planner takes a single `on_prim` callback and
+dispatches on `p->type`:
 
-Full LinuxCNC canon (STRAIGHT_FEED/STRAIGHT_TRAVERSE/DWELL/CHANGE_TOOL/
-SET_ORIGIN_OFFSETS/...) → liscio API mapping table at
+- cutting primitives → jerk-limited velocity queue
+- RAPID (G0) → max-velocity traverse
+- STOP → handled by `p->stop_reason` (dwell / tool change / program
+  end / coordinate-system change)
 
 ### Configuration flowchart
 
 ```
 What is your G64 P?
-  ├─ unset ─────────────→ tol_xyz = 0.01 (LinuxCNC default sweet spot)
+  ├─ unset ─────────────→ tol_xyz = 0.01 (LinuxCNC default — good first guess)
   ├─ 0.05 (wood/plastic) → tol_xyz = 0.05
   ├─ 0.01 (metal) ──────→ tol_xyz = 0.01
   └─ 0.001 (mold) ──────→ tol_xyz = 0.001
