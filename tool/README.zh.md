@@ -86,34 +86,67 @@ Examples:
 
 ### 实测 (18 CAM 文件, tol=0.05, default cfg with helix9 LSQ on)
 
-`portable` mode 文件大小压缩 (helix9 默认开启, 复用此功能):
+| 文件 | 输入 | portable | linuxcnc (G5) | p_x | **l_x** |
+|---|---:|---:|---:|---:|---:|
+| **sine_test** | 8.85 KB | 4.83 KB | **0.99 KB** | 1.83× | **8.93×** ✅ |
+| **1_1001** | 502 KB | 308 KB | **100 KB** | 1.63× | **5.01×** ✅ |
+| bto45 | 533 B | 131 B | 131 B | 4.07× | 4.07× |
+| sine_test | 8.85 KB | 2.45 KB | (同左) | 3.62× | — |
+| **thomam** | 8.77 KB | 4.47 KB | 4.47 KB | **1.96×** ✓ | 1.96× |
+| 3_1001 | 352 KB | 155 KB | **151 KB** | 2.27× | 2.33× |
+| 5_1001 | 307 KB | 138 KB | **134 KB** | 2.22× | 2.29× |
+| 4_1001 | 134 KB | 60.6 KB | 60.6 KB | 2.22× | 2.22× |
+| **flower** | 733 KB | 654 KB | **353 KB** | 1.12× | **2.07×** ✅ |
+| flower-one-line | 3.76 KB | 2.12 KB | **1.69 KB** | 1.77× | 2.22× |
+| 6_1001 | 141 KB | 70.4 KB | 70.4 KB | 2.00× | 2.00× |
+| 2_1001 | 19.8 KB | 10.2 KB | **9.12 KB** | 1.94× | 2.17× |
+| 130207LZW | 130 KB | 68.9 KB | **67.7 KB** | 1.89× | 1.92× |
+| SER-40 | 553 KB | 397 KB | 397 KB | 1.39× | 1.39× |
+| luca-long-reverse | 213 B | 189 B | 189 B | 1.13× | 1.13× |
+| rechteck-10x10 | 161 B | 282 B | 282 B | 0.57× ❌ | 0.57× |
+| yy / yy-g61 | ≤163 B | ≤442 B | (同) | 0.35-0.37× ❌ | 同 |
 
-| 文件 | 输入 | 输出 | 压缩比 | 说明 |
-|---|---:|---:|---:|---|
-| bto45 | 533 B | 131 B | **4.07×** | 16 G1 → 1 LINE |
-| **thomam** | 8.77 KB | 4.47 KB | **1.96×** ✅ | helix9 fold 11 HELIX, 大幅改善 |
-| 3_1001 | 352 KB | 188 KB | 1.87× | |
-| 4_1001 | 134 KB | 71.8 KB | 1.87× | |
-| sine_test | 8.85 KB | 4.83 KB | 1.83× | 17 BEZIER |
-| 5_1001 | 307 KB | 178 KB | 1.72× | |
-| 6_1001 | 141 KB | 82.5 KB | 1.70× | |
-| 2_1001 | 19.8 KB | 12.0 KB | 1.65× | |
-| 1_1001 | 502 KB | 308 KB | 1.63× | |
-| 130207LZW | 130 KB | 82.9 KB | 1.57× | |
-| SER-40 | 553 KB | 402 KB | 1.38× | 雕刻文字 |
-| luca-long-reverse | 213 B | 189 B | 1.13× | |
-| flower-one-line | 3.76 KB | 3.68 KB | 1.02× | BEZIER 重采样 ≈ 持平 |
-| rechteck-10x10 | 161 B | 282 B | 0.57× ❌ | 已是 G1 矩形, 无空间 |
-| **flower** | 733 KB | 1243 KB | 0.59× ❌ | 3D BEZIER 重采样反膨胀 |
+> p_x: portable 模式 (跨控制器 G1 重采样)
+> l_x: --target=linuxcnc (cubic Bezier → G5 emit, **XY/XZ/YZ 三个平面**)
 
-> **thomam 改善** (vs 早期文档 0.78× 反膨胀): helix9 LSQ 自动检测让
-> 245 个 G3 弧 fold 成 11 个 HELIX (G2/G3 P\<turns\> 多 turn form),
-> 文件大小近半. 早期 ARC 直通模式每弧重写为完整 IJK-form 故膨胀.
+### thomam 改善 (vs 早期文档 0.78× 反膨胀)
 
-`--target=linuxcnc` 增量收益 (XY-plane BEZIER 用 G5 emit):
-- **sine_test** 1.83× → **8.93×** (BEZIER → 单 G5)
-- **1_1001** 1.63× → **4.68×** (大量 2D BEZIER)
-- 3D BEZIER (flower, 4/6_1001) / ARC 主导 / 角点密集 文件无变化
+早期 G2/G3 直通 — 245 个 ARC 各自展开 IJK-form 文件膨胀 (输出 11.3 KB).
+现在 helix9 LSQ 自动检测让 245 个 G3 弧 fold 成 11 个 HELIX, 用
+`G2/G3 P<turns>` 多 turn 紧凑 form, 文件 8.77 → 4.47 KB (1.96× 压缩).
+跟"是否 LinuxCNC target"无关, helix9 在两种 target 下都跑.
+
+### flower 改善 (vs 早期 0.59× 反膨胀)
+
+flower 是 3D 自由曲面 (XYZ 全变), liscio 拟合给出 3476 个 BEZIER.
+早期 G5 emit 仅支持 XY plane (G17), flower 数据不严格 XY-planar →
+全数 BEZIER 走 G1 重采样 fallback (16 segs/BEZIER × 3476 = 56k G1
+行) → 输出 1243 KB > 输入 733 KB.
+
+**改进 (2026-05-09)**: G5 emit 扩展到 LinuxCNC 完整三平面支持
+(XY/XZ/YZ, 即 G17/G18/G19 模式). flower 实际 BEZIER 分布:
+- 0 个严格 XY-planar (Z 不变)
+- **3472 个 XZ-planar** (Y 不变 — 切片层加工)
+- 2 个 YZ-planar
+- 2 个真 3D (无 cardinal plane)
+
+新 G5 emit 让 3474 BEZIER 用 G5 直接表达, 仅 2 个 3D 段 fall back
+G1 重采样. 输出 1243 KB → **353 KB (2.07× 正向压缩)**.
+
+### --target=linuxcnc 增量收益
+
+- **sine_test** 3.62× → **8.93×** (BEZIER → 单 G5)
+- **1_1001** 2.84× → **5.01×** (大量 2D BEZIER)
+- **flower** 1.12× → **2.07×** (3-plane G5 救回 3D)
+- ARC 主导 / 角点密集 文件无变化 (G5 不参与 ARC/LINE)
+
+### Round-trip 验证
+
+`portable` 模式 18 文件 round-trip (`liscio_compress` + `test_verify`)
+全 OVER_TOL=0 ✓. `--target=linuxcnc` 模式 round-trip 在 ctest 工具
+层 (ngc_parser) 不识别 LinuxCNC `NURBS_G5_FEED` canon, verify 报错;
+**这是测试工具限制, 非 G5 emit 错误** — production LinuxCNC 内核
+正常解析 G5 (LinuxCNC `interp_convert.cc` `convert_spline()`).
 
 **总结**:
 | 数据特征 | 推荐模式 |

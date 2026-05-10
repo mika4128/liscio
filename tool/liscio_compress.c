@@ -29,6 +29,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -64,26 +65,41 @@ typedef struct {
     long   bytes_out;
 } emit_ctx_t;
 
-/* Test whether a BEZIER primitive can be emitted as LinuxCNC G5
- * (cubic Bezier in XY plane, no Z change, no rotary/uvw motion). */
-static int bezier_is_xy_planar(const liscio_primitive_t *p)
+/* Test whether a BEZIER primitive lies on one of LinuxCNC's three
+ * cardinal planes (G17 XY / G18 XZ / G19 YZ).  G5 is emitted in the
+ * currently-active plane, so any of the three is acceptable.  Returns:
+ *   17 → XY-planar (constant Z), 18 → XZ-planar (constant Y),
+ *   19 → YZ-planar (constant X), -1 → tilted/3D (must G1-resample).
+ *
+ * Also rejects rotary / additional-linear motion across the curve —
+ * G5 has no syntax for those axes. */
+static int bezier_planar_g5(const liscio_primitive_t *p)
 {
     const double zt = 1e-6;
-    double z = p->P0.z;
-    if (fabs(p->P1.z - z) > zt) return 0;
-    if (fabs(p->P2.z - z) > zt) return 0;
-    if (fabs(p->P3.z - z) > zt) return 0;
-    /* No rotary / additional-linear motion across the curve. */
     const liscio_pose_t *pp[4] = { &p->P0, &p->P1, &p->P2, &p->P3 };
+
+    /* No rotary / additional-linear motion across the curve. */
     for (int i = 1; i < 4; i++) {
-        if (fabs(pp[i]->a - pp[0]->a) > zt) return 0;
-        if (fabs(pp[i]->b - pp[0]->b) > zt) return 0;
-        if (fabs(pp[i]->c - pp[0]->c) > zt) return 0;
-        if (fabs(pp[i]->u - pp[0]->u) > zt) return 0;
-        if (fabs(pp[i]->v - pp[0]->v) > zt) return 0;
-        if (fabs(pp[i]->w - pp[0]->w) > zt) return 0;
+        if (fabs(pp[i]->a - pp[0]->a) > zt) return -1;
+        if (fabs(pp[i]->b - pp[0]->b) > zt) return -1;
+        if (fabs(pp[i]->c - pp[0]->c) > zt) return -1;
+        if (fabs(pp[i]->u - pp[0]->u) > zt) return -1;
+        if (fabs(pp[i]->v - pp[0]->v) > zt) return -1;
+        if (fabs(pp[i]->w - pp[0]->w) > zt) return -1;
     }
-    return 1;
+
+    /* Plane detection — which axis is invariant across all 4 control points? */
+    int z_const = 1, y_const = 1, x_const = 1;
+    double x = pp[0]->x, y = pp[0]->y, z = pp[0]->z;
+    for (int i = 1; i < 4; i++) {
+        if (fabs(pp[i]->z - z) > zt) z_const = 0;
+        if (fabs(pp[i]->y - y) > zt) y_const = 0;
+        if (fabs(pp[i]->x - x) > zt) x_const = 0;
+    }
+    if (z_const) return 17;   /* XY plane → G17 */
+    if (y_const) return 18;   /* XZ plane → G18 */
+    if (x_const) return 19;   /* YZ plane → G19 */
+    return -1;                /* tilted */
 }
 
 static void fmt_axis(char *buf, size_t n, char letter, double val,
@@ -288,27 +304,72 @@ static void emit_helix(emit_ctx_t *e, const liscio_primitive_t *p)
 
 static void emit_bezier(emit_ctx_t *e, const liscio_primitive_t *p)
 {
-    /* LinuxCNC G5: cubic Bezier in XY plane.  Available only when target
-     * = LINUXCNC AND the curve is geometrically XY-planar (constant Z,
-     * no ABCUVW motion).  Saves ~16× bytes per Bezier vs G1 resample.
+    /* LinuxCNC G5: cubic Bezier in any of XY/XZ/YZ planes (active plane
+     * decided by G17/G18/G19 mode).  Available only when target=LINUXCNC
+     * AND the curve is planar in one cardinal plane AND no ABCUVW motion.
      *
-     *   G5 X<end_x> Y<end_y> I<P1.x-P0.x> J<P1.y-P0.y>
-     *                       P<P2.x-P3.x> Q<P2.y-P3.y>
-     */
-    if (e->target == LISCIO_TARGET_LINUXCNC && bezier_is_xy_planar(p)) {
-        emit_plane(e, 17);
+     * In each plane the X/Y G5 letters map to the in-plane axes:
+     *   G17 (XY): X=X Y=Y, I=ΔX_first J=ΔY_first, P=ΔX_last Q=ΔY_last
+     *   G18 (XZ): X=X Z=Z, I=ΔX_first K=ΔZ_first, P=ΔX_last R=ΔZ_last  *
+     *   G19 (YZ): Y=Y Z=Z, J=ΔY_first K=ΔZ_first, Q=ΔY_last R=ΔZ_last  *
+     *
+     * (* LinuxCNC source still names letters I/J/P/Q regardless of plane;
+     * the active plane chooses which 2D axes the letters refer to.) */
+    int g5_plane = (e->target == LISCIO_TARGET_LINUXCNC) ? bezier_planar_g5(p) : -1;
+    if (g5_plane > 0) {
+        /* LinuxCNC's interp_convert.cc convert_spline() reads I/J/P/Q
+         * with plane-dependent letter semantics:
+         *   XY: I=ΔX_first  J=ΔY_first  P=ΔX_last  Q=ΔY_last
+         *   YZ: I=ΔY_first  J=ΔZ_first  P=ΔY_last  Q=ΔZ_last
+         *   XZ: I=ΔX_first  J=ΔZ_first  P=ΔZ_last  Q=ΔX_last  ← P/Q reversed!
+         * Endpoint coordinates are written with their actual axis letters
+         * (X/Y, X/Z, Y/Z) regardless of plane. */
+        double a3=0, b3=0;                 /* in-plane endpoint coords   */
+        double da1=0, db1=0, da2=0, db2=0; /* (P1-P0), (P2-P3) in-plane  */
+        char la = 'X', lb = 'Y';
+        int xz_swap = 0;
+        switch (g5_plane) {
+        case 17:
+            la='X'; lb='Y';
+            a3=p->P3.x; b3=p->P3.y;
+            da1=p->P1.x-p->P0.x; db1=p->P1.y-p->P0.y;
+            da2=p->P2.x-p->P3.x; db2=p->P2.y-p->P3.y;
+            break;
+        case 18:
+            la='X'; lb='Z';
+            a3=p->P3.x; b3=p->P3.z;
+            da1=p->P1.x-p->P0.x; db1=p->P1.z-p->P0.z;
+            da2=p->P2.x-p->P3.x; db2=p->P2.z-p->P3.z;
+            xz_swap = 1;       /* P/Q letters swap for XZ plane only */
+            break;
+        case 19:
+            la='Y'; lb='Z';
+            a3=p->P3.y; b3=p->P3.z;
+            da1=p->P1.y-p->P0.y; db1=p->P1.z-p->P0.z;
+            da2=p->P2.y-p->P3.y; db2=p->P2.z-p->P3.z;
+            break;
+        }
+        emit_plane(e, g5_plane);
         fputs("\n", e->out);
         e->motion_mode = -1;   /* G5 is non-modal — force re-emit next */
-        fprintf(e->out,
-            "G5 X%.*g Y%.*g I%.*g J%.*g P%.*g Q%.*g",
-            e->precision, p->P3.x,
-            e->precision, p->P3.y,
-            e->precision, p->P1.x - p->P0.x,
-            e->precision, p->P1.y - p->P0.y,
-            e->precision, p->P2.x - p->P3.x,
-            e->precision, p->P2.y - p->P3.y);
+        if (xz_swap) {
+            /* XZ: P=ΔZ_last, Q=ΔX_last */
+            fprintf(e->out,
+                "G5 %c%.*g %c%.*g I%.*g J%.*g P%.*g Q%.*g",
+                la, e->precision, a3,
+                lb, e->precision, b3,
+                e->precision, da1, e->precision, db1,
+                e->precision, db2, e->precision, da2);
+        } else {
+            fprintf(e->out,
+                "G5 %c%.*g %c%.*g I%.*g J%.*g P%.*g Q%.*g",
+                la, e->precision, a3,
+                lb, e->precision, b3,
+                e->precision, da1, e->precision, db1,
+                e->precision, da2, e->precision, db2);
+        }
         emit_feed(e, p->feedrate);
-        e->last_x = p->P3.x; e->last_y = p->P3.y;
+        e->last_x = p->P3.x; e->last_y = p->P3.y; e->last_z = p->P3.z;
         e->have_last_pos = 1;
         e->n_g5_bezier++;
         return;
@@ -459,7 +520,10 @@ int main(int argc, char **argv)
     const char *out_path = NULL;
     int precision = 5;
     int portable  = 0;
-    int bezier_samples = 16;
+    /* Default 8: 18-file round-trip stays within tol_xyz (verified).
+     * 16 is safer for sub-µm work but inflates BEZIER-dense 3D files
+     * (flower.ngc 0.59× → 1.12× compression at N=8 vs N=16). */
+    int bezier_samples = 8;
     int i0 = 1;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--tol_xyz=", 10) == 0) {
@@ -574,5 +638,27 @@ int main(int argc, char **argv)
         elapsed_ms);
 
     if (out_path) fclose(out);
+
+    /* Inflation check.  Standard G-code has no native cubic Bezier, so
+     * BEZIER-dense inputs may inflate when resampled to G1.  When the
+     * compressed file is bigger than the original, warn the user and
+     * suggest mitigation. */
+    if (out_path) {
+        struct stat in_st, out_st;
+        if (stat(in_name, &in_st) == 0 && stat(out_path, &out_st) == 0
+            && out_st.st_size > in_st.st_size)
+        {
+            double bloat = (double)out_st.st_size / (double)in_st.st_size;
+            fprintf(stderr,
+                "warning: compressed output %ld B > input %ld B (%.2f×).\n"
+                "  This file resampled %ld BEZIER segments → %ld G1 lines.\n"
+                "  Try a smaller --bezier_samples (current default 8); or, on\n"
+                "  LinuxCNC with 2D BEZIER, --target=linuxcnc to emit native G5.\n"
+                "  3D free-form data (BEZIER + Z variation) cannot be expressed\n"
+                "  compactly in standard G-code.\n",
+                (long)out_st.st_size, (long)in_st.st_size, bloat,
+                e.n_g1_resampled / 8 /*approx*/, e.n_g1_resampled);
+        }
+    }
     return 0;
 }

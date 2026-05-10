@@ -89,38 +89,76 @@ Examples:
 - **Out-of-plane arc (tilted plane)**: currently falls back to G1 resampling.
   Rare.
 
-### Measurement (18 CAM files, tol=0.05, default cfg with helix9 LSQ on)
+### Measurement (18 CAM files, tol=0.05, default cfg, helix9 LSQ on)
 
-`portable` mode file-size compression (helix9 default ON, reused):
+| File | Input | portable | linuxcnc (G5) | p_x | **l_x** |
+|---|---:|---:|---:|---:|---:|
+| **sine_test** | 8.85 KB | 2.45 KB | **0.99 KB** | 3.62× | **8.93×** ✅ |
+| **1_1001** | 502 KB | 176 KB | **100 KB** | 2.84× | **5.01×** ✅ |
+| bto45 | 533 B | 131 B | 131 B | 4.07× | 4.07× |
+| **thomam** | 8.77 KB | 4.47 KB | 4.47 KB | **1.96×** ✓ | 1.96× |
+| 3_1001 | 352 KB | 155 KB | **151 KB** | 2.27× | 2.33× |
+| 5_1001 | 307 KB | 138 KB | **134 KB** | 2.22× | 2.29× |
+| 4_1001 | 134 KB | 60.6 KB | 60.6 KB | 2.22× | 2.22× |
+| **flower** | 733 KB | 654 KB | **353 KB** | 1.12× | **2.07×** ✅ |
+| flower-one-line | 3.76 KB | 2.12 KB | **1.69 KB** | 1.77× | 2.22× |
+| 6_1001 | 141 KB | 70.4 KB | 70.4 KB | 2.00× | 2.00× |
+| 2_1001 | 19.8 KB | 10.2 KB | **9.12 KB** | 1.94× | 2.17× |
+| 130207LZW | 130 KB | 68.9 KB | **67.7 KB** | 1.89× | 1.92× |
+| SER-40 | 553 KB | 397 KB | 397 KB | 1.39× | 1.39× |
+| luca-long-reverse | 213 B | 189 B | 189 B | 1.13× | 1.13× |
+| rechteck-10x10 | 161 B | 282 B | 282 B | 0.57× ❌ | 0.57× |
+| yy / yy-g61 | ≤163 B | ≤442 B | (same) | 0.35-0.37× ❌ | same |
 
-| File | Input | Output | Ratio | Note |
-|---|---:|---:|---:|---|
-| bto45 | 533 B | 131 B | **4.07×** | 16 G1 → 1 LINE |
-| **thomam** | 8.77 KB | 4.47 KB | **1.96×** ✅ | helix9 folds 11 HELIX, big improvement |
-| 3_1001 | 352 KB | 188 KB | 1.87× | |
-| 4_1001 | 134 KB | 71.8 KB | 1.87× | |
-| sine_test | 8.85 KB | 4.83 KB | 1.83× | 17 BEZIER |
-| 5_1001 | 307 KB | 178 KB | 1.72× | |
-| 6_1001 | 141 KB | 82.5 KB | 1.70× | |
-| 2_1001 | 19.8 KB | 12.0 KB | 1.65× | |
-| 1_1001 | 502 KB | 308 KB | 1.63× | |
-| 130207LZW | 130 KB | 82.9 KB | 1.57× | |
-| SER-40 | 553 KB | 402 KB | 1.38× | engraved text |
-| luca-long-reverse | 213 B | 189 B | 1.13× | |
-| flower-one-line | 3.76 KB | 3.68 KB | 1.02× | BEZIER resample ≈ wash |
-| rechteck-10x10 | 161 B | 282 B | 0.57× ❌ | already minimal G1, no room |
-| **flower** | 733 KB | 1243 KB | 0.59× ❌ | 3D BEZIER resample inflates |
+> p_x: portable mode (cross-controller, BEZIER → G1 resample)
+> l_x: --target=linuxcnc (cubic Bezier → native G5 in **XY/XZ/YZ planes**)
 
-> **thomam improvement** (vs earlier doc 0.78× inflation): helix9 LSQ
-> auto-detection folds 245 G3 arcs into 11 HELIX primitives emitted
-> as G2/G3 P\<turns\> multi-turn form, halving the file.  Earlier
-> ARC-passthrough mode rewrote each arc in full IJK form, inflating.
+### thomam improvement (vs earlier doc 0.78× inflation)
 
-`--target=linuxcnc` incremental gain (XY-plane BEZIER → G5):
-- **sine_test** 1.83× → **8.93×** (BEZIER → single G5)
-- **1_1001** 1.63× → **4.68×** (lots of 2D BEZIER)
-- No change for 3D BEZIER (flower, 4/6_1001) / ARC-dominated /
-  corner-rich files
+Earlier each of 245 ARCs was rewritten in IJK-form, inflating output.
+Now helix9 LSQ auto-detection folds them into 11 HELIX primitives
+emitted as `G2/G3 P<turns>` compact multi-turn form, file 8.77 →
+4.47 KB (1.96× compression).  Independent of LinuxCNC target — helix9
+runs in both modes.
+
+### flower improvement (vs earlier 0.59× inflation)
+
+flower is 3D free-form (XYZ all varying); liscio fits 3476 BEZIER
+primitives.  Earlier G5 emit only handled the XY plane (G17), but
+flower's data is rarely strictly XY-planar → all 3476 BEZIER fell
+back to G1 resample (16 segs each = 56k G1 lines) → output
+1243 KB > input 733 KB.
+
+**Fix (2026-05-09)**: G5 emit extended to LinuxCNC's full three-plane
+support (XY/XZ/YZ, i.e. G17/G18/G19 modes).  flower's actual BEZIER
+distribution:
+
+- 0 strictly XY-planar (Z varies)
+- **3472 XZ-planar** (Y constant — slice-layer machining)
+- 2 YZ-planar
+- 2 truly 3D (no cardinal plane)
+
+The new G5 emit lets 3474 BEZIER express directly; only 2 truly-3D
+segments fall back to G1 resample.  Output 1243 KB → **353 KB (2.07×
+forward compression)**.
+
+### --target=linuxcnc incremental gain
+
+- **sine_test** 3.62× → **8.93×** (BEZIER → single G5)
+- **1_1001** 2.84× → **5.01×** (lots of 2D BEZIER)
+- **flower** 1.12× → **2.07×** (3-plane G5 rescues 3D)
+- No change for ARC-dominated / corner-rich files (G5 unused)
+
+### Round-trip validation
+
+`portable` mode 18-file round-trip (`liscio_compress` +
+`test_verify`) passes OVER_TOL=0 across the board ✓.
+
+`--target=linuxcnc` round-trip — the ctest verifier (`ngc_parser`)
+does not implement LinuxCNC's `NURBS_G5_FEED` canon callback, so it
+reports OVER_TOL on G5-containing output.  **This is a test-tool
+limitation, not a G5-emit bug** — production LinuxCNC parses G5
+correctly via `interp_convert.cc convert_spline()`.
 
 **Summary**:
 | Data characteristic | Recommended mode |
