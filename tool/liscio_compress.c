@@ -109,7 +109,38 @@ static void fmt_axis(char *buf, size_t n, char letter, double val,
         buf[0] = '\0';
         return;
     }
-    snprintf(buf, n, " %c%.*g", letter, prec, val);
+    /* Use %.*f (fixed-point), never %g.  G-code parsers reject
+     * scientific notation like "Y6.6066e-05" emitted by %g when the
+     * exponent goes below -4.  After fixed-point formatting, strip
+     * trailing zeros and the dangling decimal point for compactness. */
+    int w = snprintf(buf, n, " %c%.*f", letter, prec, val);
+    if (w > 0 && (size_t)w < n) {
+        char *dot = strchr(buf, '.');
+        if (dot) {
+            char *p = buf + w - 1;
+            while (p > dot && *p == '0') *p-- = '\0';
+            if (*p == '.') *p = '\0';
+        }
+        /* Collapse "-0" → "0" for the rare exact-zero rounding case. */
+        if (buf[2] == '-' && buf[3] == '0' && buf[4] == '\0') buf[2] = '0';
+    }
+}
+
+/* Format a bare decimal number (no axis letter, no leading space).
+ * Same fixed-point + zero-strip policy as fmt_axis. */
+static int fmt_num(char *buf, size_t n, double val, int prec)
+{
+    int w = snprintf(buf, n, "%.*f", prec, val);
+    if (w > 0 && (size_t)w < n) {
+        char *dot = strchr(buf, '.');
+        if (dot) {
+            char *p = buf + w - 1;
+            while (p > dot && *p == '0') { *p-- = '\0'; w--; }
+            if (*p == '.') { *p = '\0'; w--; }
+        }
+        if (buf[0] == '-' && buf[1] == '0' && buf[2] == '\0') { buf[0] = '0'; w = 1; }
+    }
+    return w;
 }
 
 static void emit_pose_xyz(emit_ctx_t *e, double x, double y, double z)
@@ -144,7 +175,11 @@ static void emit_feed(emit_ctx_t *e, double feed)
 {
     if (feed <= 0.0) return;
     if (e->have_last_pos && fabs(feed - e->last_feed) < 1e-6) return;
-    fprintf(e->out, " F%.*g", e->precision, feed);
+    {
+        char nb[32];
+        fmt_num(nb, sizeof(nb), feed, e->precision);
+        fprintf(e->out, " F%s", nb);
+    }
     e->last_feed = feed;
 }
 
@@ -240,12 +275,21 @@ static void emit_arc(emit_ctx_t *e, const liscio_primitive_t *p,
     double di = p->cx - p->start.x;
     double dj = p->cy - p->start.y;
     double dk = p->cz - p->start.z;
-    if (plane == 17) {
-        fprintf(e->out, " I%.*g J%.*g", e->precision, di, e->precision, dj);
-    } else if (plane == 18) {
-        fprintf(e->out, " I%.*g K%.*g", e->precision, di, e->precision, dk);
-    } else /* 19 */ {
-        fprintf(e->out, " J%.*g K%.*g", e->precision, dj, e->precision, dk);
+    {
+        char nb1[32], nb2[32];
+        if (plane == 17) {
+            fmt_num(nb1, sizeof(nb1), di, e->precision);
+            fmt_num(nb2, sizeof(nb2), dj, e->precision);
+            fprintf(e->out, " I%s J%s", nb1, nb2);
+        } else if (plane == 18) {
+            fmt_num(nb1, sizeof(nb1), di, e->precision);
+            fmt_num(nb2, sizeof(nb2), dk, e->precision);
+            fprintf(e->out, " I%s K%s", nb1, nb2);
+        } else /* 19 */ {
+            fmt_num(nb1, sizeof(nb1), dj, e->precision);
+            fmt_num(nb2, sizeof(nb2), dk, e->precision);
+            fprintf(e->out, " J%s K%s", nb1, nb2);
+        }
     }
     if (n_full_turns > 0)
         fprintf(e->out, " P%d", n_full_turns);
@@ -352,21 +396,18 @@ static void emit_bezier(emit_ctx_t *e, const liscio_primitive_t *p)
         emit_plane(e, g5_plane);
         fputs("\n", e->out);
         e->motion_mode = -1;   /* G5 is non-modal — force re-emit next */
-        if (xz_swap) {
-            /* XZ: P=ΔZ_last, Q=ΔX_last */
-            fprintf(e->out,
-                "G5 %c%.*g %c%.*g I%.*g J%.*g P%.*g Q%.*g",
-                la, e->precision, a3,
-                lb, e->precision, b3,
-                e->precision, da1, e->precision, db1,
-                e->precision, db2, e->precision, da2);
-        } else {
-            fprintf(e->out,
-                "G5 %c%.*g %c%.*g I%.*g J%.*g P%.*g Q%.*g",
-                la, e->precision, a3,
-                lb, e->precision, b3,
-                e->precision, da1, e->precision, db1,
-                e->precision, da2, e->precision, db2);
+        {
+            char na3[32], nb3[32], ni[32], nj[32], np[32], nq[32];
+            fmt_num(na3, sizeof(na3), a3, e->precision);
+            fmt_num(nb3, sizeof(nb3), b3, e->precision);
+            fmt_num(ni,  sizeof(ni),  da1, e->precision);
+            fmt_num(nj,  sizeof(nj),  db1, e->precision);
+            /* XZ plane needs P/Q letters reversed — see LinuxCNC
+             * interp_convert.cc convert_spline() XZ branch. */
+            fmt_num(np,  sizeof(np),  xz_swap ? db2 : da2, e->precision);
+            fmt_num(nq,  sizeof(nq),  xz_swap ? da2 : db2, e->precision);
+            fprintf(e->out, "G5 %c%s %c%s I%s J%s P%s Q%s",
+                    la, na3, lb, nb3, ni, nj, np, nq);
         }
         emit_feed(e, p->feedrate);
         e->last_x = p->P3.x; e->last_y = p->P3.y; e->last_z = p->P3.z;
@@ -423,7 +464,11 @@ static void emit_stop(emit_ctx_t *e, const liscio_primitive_t *p)
     e->motion_mode = -1;   /* M-code/G4 break modal motion */
     switch (p->stop_reason) {
     case LISCIO_STOP_DWELL:
-        fprintf(e->out, "G4 P%.*g", e->precision, p->stop_dwell_seconds);
+        {
+            char nb[32];
+            fmt_num(nb, sizeof(nb), p->stop_dwell_seconds, e->precision);
+            fprintf(e->out, "G4 P%s", nb);
+        }
         break;
     case LISCIO_STOP_PROGRAM:           fputs("M0", e->out); break;
     case LISCIO_STOP_OPTIONAL:          fputs("M1", e->out); break;
@@ -589,18 +634,33 @@ int main(int argc, char **argv)
     e.plane = 0;          /* unset → first arc emits its plane */
     e.motion_mode = -1;
     e.last_feed = -1.0;
+    /* Assume the machine starts at the origin (LinuxCNC convention).
+     * This way the first emitted motion only mentions axes that move,
+     * matching the original NGC.  Without this, "G0 Z19" in the input
+     * would round-trip as "G0 X0 Y0 Z19" — confusing to operators. */
+    e.last_x = e.last_y = e.last_z = 0.0;
+    e.last_a = e.last_b = e.last_c = 0.0;
+    e.last_u = e.last_v = e.last_w = 0.0;
+    e.have_last_pos = 1;
 
     /* Preamble */
     const char *in_name = argv[i0];
     const char *base = strrchr(in_name, '/');
     base = base ? base + 1 : in_name;
     fprintf(out, "%%\n");
-    fprintf(out, "( liscio-compressed: tol=%.*g mm; in=%s )\n",
-            precision, cfg.tol_xyz, base);
+    {
+        char nb[32];
+        fmt_num(nb, sizeof(nb), cfg.tol_xyz, precision);
+        fprintf(out, "( liscio-compressed: tol=%s mm; in=%s )\n", nb, base);
+    }
     fprintf(out, "G21\n");                      /* mm */
     fprintf(out, "G17\n");  e.plane = 17;       /* default XY */
     fprintf(out, "G90\n");                      /* absolute */
-    fprintf(out, "G64 P%.*g\n", precision, cfg.tol_xyz); /* path tolerance */
+    {
+        char nb[32];
+        fmt_num(nb, sizeof(nb), cfg.tol_xyz, precision);
+        fprintf(out, "G64 P%s\n", nb);                     /* path tolerance */
+    }
 
     liscio_ctx_t *ctx = liscio_create(&cfg);
     liscio_set_callback(ctx, on_prim, &e);
