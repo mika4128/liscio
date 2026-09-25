@@ -148,6 +148,7 @@ typedef struct {
     int    tag_line_first;    /* first absorbed G-code line */
     int    tag_line_last;     /* last  absorbed G-code line  */
     int    n_absorbed;        /* # input segs merged into this primitive */
+    int    from_arc_g2;       /* 1: analytic arc-chain G2 quintic (not G1 fit) */
 
     /* STOP-event metadata (valid when type == LISCIO_PRIM_STOP).
      * For other primitive types these are zero. */
@@ -163,6 +164,14 @@ typedef struct {
     double tol_xyz;       /* mm */
     double tol_abc;       /* deg */
     double tol_uvw;       /* mm (<=0 uses tol_xyz) */
+    double tol_arcfit;    /* mm: geometry-RECONSTRUCTION tolerance for the
+                           * arc-chain G2 fusion quintic fit & kink absorption.
+                           * Decoupled from tol_xyz (= G64 P, the corner-BLEND
+                           * deviation budget): a large P must widen blends,
+                           * never coarsen the rebuilt arc geometry (measured:
+                           * P0.2 lets a kink be absorbed in ONE sloppy quintic
+                           * → curvature ripple → v_jcap crawl; P grows, result
+                           * WORSENS).  <=0 falls back to tol_xyz (legacy). */
     int    max_window;    /* max points buffered before forced emit (default 128) */
     int    min_arc_pts;   /* min consecutive pts to trigger arc fit (default 5) */
     double min_arc_radius;  /* lower bound on detected radius (mm, default 0.001) */
@@ -194,6 +203,8 @@ typedef struct {
      * Tried after composite Bezier; captures complex smooth curves
      * more compactly (one primitive, any M ctrl points). */
     int    enable_bspline;
+    int    enable_g2_quintic;  /* try a κ=0 quintic (G2 at bezier↔line seams) before the cubic */
+    int    enable_g2_curvature;/* try a κ≠0 curvature-matched quintic (C2 at curve/arc seams) */
 
     /* Initial # control points for B-spline fit attempt (default 6).
      * If fit fails, window is split and each half attempts smaller
@@ -272,6 +283,75 @@ typedef struct {
      *   corner_hard_angle_deg  = 60.0  (only consulted in LOOKAHEAD) */
     int    corner_detection_mode;
     double corner_hard_angle_deg;
+
+    /* G1 continuity chaining (default 0 = legacy).  When 1:
+     *   - long-segment-isolation flushes do NOT drop the cross-flush
+     *     tangent (they are not real corners),
+     *   - on each window flush, when a previous primitive exit-tangent is
+     *     known, a G1-constrained cubic Bezier is attempted FIRST (before
+     *     collinear-LINE / arc / unconstrained fits) so consecutive
+     *     primitives meet tangentially (sub-degree boundary angle).
+     * Removes the jerk-kink corner cap on densely-sampled smooth paths
+     * (the #2 dense-crawl fix) without relaxing real-corner handling:
+     * genuine corners still flush + clear the tangent, and the G1 fit
+     * still gates on tol_xyz so sharp turns fall through to a split. */
+    int    enable_g1_chain;
+
+    /* Prefer B-spline over Bezier in the fit ladder (default 0 = legacy
+     * Bezier-first).  When 1, a window that would otherwise fit as a
+     * single cubic Bezier is first offered to the C2 B-spline fitter, so
+     * densely-sampled smooth runs become curvature-continuous SPLINE
+     * primitives (type 7) instead of cubic BEZIERs (type 6).  A cubic
+     * Bezier concentrates a window's bend into a sub-segment curvature
+     * spike (high dκ/ds) that the RT centripetal-jerk cap
+     * v ≤ cbrt(j_n/√(κ⁴+(dκ/ds)²)) throttles to a crawl; a B-spline
+     * spreads the curvature so dκ/ds stays bounded.  This is the #2
+     * dense-path-crawl fix.  Bezier remains the fallback when the
+     * B-spline fit fails the length/deviation check. */
+    int    prefer_bspline;
+
+    /* Micro-cusp cluster collapse (default 1 = on).  When a HARD corner
+     * (> corner_hard_angle_deg) occurs between two sub-tolerance segments,
+     * the tool path is thrashing direction at the resolution floor (e.g.
+     * CAM point-engraving: 3 sharp corners packed within ~2 µm).  Emitting
+     * each as its own primitive forces N separate v=0 junctions in a tiny
+     * span → an un-machinable "stop N times in 2 µm" that spikes per-axis
+     * jerk to millions.  Per the micro-segment literature (Ernesto/Farouki
+     * 2011: a true cusp forces v=0; Bi 2018: corner-by-corner transition
+     * fails on dense micro-lines), collapse the cluster to a SINGLE
+     * tolerance-bounded stop point: once triggered, decimate subsequent
+     * points that stay within collapse_cusp_tol of the cluster anchor
+     * (geometrically indistinct at that tolerance), resuming normal fitting
+     * when the path escapes the ball.  The geometric error is bounded by
+     * collapse_cusp_tol.  Only engages in hard-corner-between-micro-segment
+     * thrash regions; smooth micro-segment runs (no hard corners) are never
+     * affected. */
+    int    collapse_cusp_enable;
+    double collapse_cusp_tol;   /* mm; <=0 follows tol_xyz */
+
+    /* Arc-chain G2 spline fusion (default 0 = off).  When 1, liscio_add_arc
+     * fuses a run of tangent-continuous G2/G3 arcs into a C2-continuous
+     * sequence of curvature-matched quintic (degree-5) SPLINE primitives,
+     * ANALYTICALLY — each arc is emitted as one (or, on a wide sweep / a
+     * curvature-mismatched seam, several bisected) quintic whose endpoint
+     * curvature is the EXACT κ=1/R of the arc and whose seam curvature is
+     * pinned to the neighbour via the ctx G2 chain (prev_emit_kappa).  This
+     * removes the per-seam curvature STEP of a raw arc chain (different radii)
+     * — the source of thomam's ripple + jerk — without the faceting noise of
+     * arc_subseg_samples (which samples arcs into LINE segments through the
+     * G1 LSQ pipeline).  A real corner (tangent break) or a turn-sign flip
+     * breaks the chain so the seam falls to a blend join.  Opt-in; native arc
+     * passthrough (OFF) stays the default.  See doc/方案-弧链G2融合. */
+    int    arc_g2fuse;
+
+    /* Merge only same-feedrate segments (default 1 = on).  A fitted
+     * primitive carries ONE feedrate (prim.feedrate), so it may only span
+     * input segments that share the same F: an F change flushes the G1
+     * window (the new segment starts a fresh window), breaks arc-merge /
+     * arc-helix buffering and the arc-G2 fusion chain.  Set 0 to restore
+     * the legacy behaviour (mixed-F windows merged and inherited the first
+     * segment's F).  feedrate <= 0 is treated as "unset" (wildcard). */
+    int    merge_same_feed_only;
 } liscio_cfg_t;
 
 typedef enum {
@@ -314,6 +394,7 @@ typedef struct {
     long emitted_line;        /* # LINE primitives emitted */
     long emitted_arc;         /* # ARC primitives emitted */
     long emitted_spline;      /* # SPLINE primitives emitted */
+    long emitted_g2_quintic;  /* # κ=0 quintic (G2) primitives emitted */
     long absorbed_total;      /* sum of all primitive.n_absorbed */
     double max_arc_deviation; /* max deviation observed during successful arc fits */
 } liscio_stats_t;
@@ -379,6 +460,12 @@ int liscio_emit_stop(liscio_ctx_t *ctx,
  * or when upstream context breaks (tool change, dwell, rapid). */
 void liscio_flush(liscio_ctx_t *ctx);
 
+/* Flush ONLY the pending G1 line window (not the arc-chain fusion pending
+ * arc).  Bridge helper: call before switching modal from lines to an arc so
+ * fitted lines emit under the line modal while the fusion seam-tangent
+ * handshake survives across consecutive liscio_add_arc calls. */
+void liscio_flush_lines(liscio_ctx_t *ctx);
+
 /* Map a primitive parameter t∈[0,1] to the original G-code line number.
  * Used by UI/debug:  "what line is currently executing?"  Linear
  * interpolation between tag_line_first..tag_line_last; for single-line
@@ -390,8 +477,21 @@ int liscio_primitive_line_at(const liscio_primitive_t *prim, double t);
  * emitting.  Use for program restart. */
 void liscio_reset(liscio_ctx_t *ctx);
 
+/* Update path-fit / collinear tolerances (G64 P change or new program).
+ * Does not flush the window — call liscio_reset first on a hard boundary
+ * if buffered geometry must be dropped.  tol_arcfit <= 0 follows tol_xyz. */
+void liscio_set_path_tol(liscio_ctx_t *ctx, double tol_xyz, double tol_arcfit);
+
 /* Get runtime stats snapshot. */
 void liscio_get_stats(const liscio_ctx_t *ctx, liscio_stats_t *out);
+
+/* Worst-case number of primitives ONE liscio_add_arc() call can emit in
+ * arc_g2fuse mode (bisection recursion leaves = 2^ARCG2_MAXDEPTH, each a
+ * spline or native sub-arc).  Callers that enqueue one output object per
+ * primitive must reserve this much output-queue headroom around an arc
+ * feed — a mid-emit overflow drops primitives and cuts a chord across the
+ * programmed path (1_1001 N36555 teleport, 2026-08-17). */
+int liscio_arc_g2_burst_bound(void);
 
 /* ---------- NURBS / rational Bezier utilities ---------- */
 

@@ -262,7 +262,11 @@ int liscio_bspline9_fit(const struct liscio_ctx *ctx, int i0, int i1,
             return -1;
     }
 
-    /* Deviation check in XYZ at waypoints. */
+    /* Deviation check in XYZ at waypoints.
+     * TODO(densify): waypoint-only residual — a long unanchored span can
+     * bulge between waypoints (same hole the cubic fitters had; see
+     * densify_window in liscio_bezier9.c).  Apply the same densified
+     * input before enabling (env-gated OFF in TP2: TP2_BSPLINE). */
     double max_dev = 0.0;
     for (int i = 0; i < n; i++) {
         double bx = bspline_eval_1d(ctrl[0], M, U, ts[i]);

@@ -45,6 +45,33 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ---- DIAGNOSTIC instrumentation (#2 dense-crawl investigation) ----
+ * Unconditional globals (negligible cost); read by test_fit_stats to see
+ * WHY windows flush + which emit paths fire.  STRIP before final commit. */
+struct liscio_dbg_counters {
+    long flush_corner, flush_disc, flush_maxwin, flush_final;
+    long flush_feedchg;                /* same-F gate: F change split the window */
+    long emit_line_collin, emit_line_fallback;
+    long bez_g1_used, bez_g1_miss;   /* cross-window G1 pin on first bezier */
+    long stream_absorb;              /* add_line collinear extend (no new pt) */
+};
+struct liscio_dbg_counters liscio_dbg = {0};
+void liscio_dbg_reset(void) { memset(&liscio_dbg, 0, sizeof(liscio_dbg)); }
+
+/* "Same F" for merge gating (cfg.merge_same_feed_only): non-positive is a
+ * wildcard (unset); otherwise require agreement up to fp noise (rel 1e-9,
+ * same yardstick as the streaming collinear absorb's feed match).
+ * TP2_LISCIO_NOFGATE=1 bypasses the gate entirely — diagnostic A/B switch
+ * for F-change window splits (process-cached: relaunch to flip). */
+static int feed_match(double fa, double fb)
+{
+    static int nogate = -1;
+    if (nogate < 0) nogate = getenv("TP2_LISCIO_NOFGATE") ? 1 : 0;
+    if (nogate) return 1;
+    if (fa <= 0.0 || fb <= 0.0) return 1;
+    return fabs(fa - fb) < 1e-9 * fmax(1.0, fmax(fabs(fa), fabs(fb)));
+}
+
 /* ------------------------------------------------------------------ */
 void liscio_cfg_default(liscio_cfg_t *cfg)
 {
@@ -52,6 +79,7 @@ void liscio_cfg_default(liscio_cfg_t *cfg)
     cfg->tol_xyz      = 0.01;      /* 10 μm */
     cfg->tol_abc      = 0.1;       /* 0.1 deg */
     cfg->tol_uvw      = -1.0;      /* follow xyz */
+    cfg->tol_arcfit   = 0.0;       /* <=0 follows tol_xyz (fusion sets its own cap) */
     cfg->max_window   = LISCIO_MAX_WINDOW;
     cfg->min_arc_pts  = 5;
     cfg->min_arc_radius = 1e-3;    /* 1 μm */
@@ -61,6 +89,8 @@ void liscio_cfg_default(liscio_cfg_t *cfg)
     cfg->enable_bezier   = 1;
     cfg->enable_composite_bezier = 1;
     cfg->enable_bspline  = 1;
+    cfg->enable_g2_quintic = 0;
+    cfg->enable_g2_curvature = 0;
     cfg->bspline_init_ctrl = 6;
     cfg->arc_subseg_samples = 0;   /* 0 = passthrough (default lossless) */
     cfg->arc_merge_mode     = 0;   /* LISCIO_ARC_MERGE_OFF (default) */
@@ -73,6 +103,12 @@ void liscio_cfg_default(liscio_cfg_t *cfg)
                                          * tol_xyz residual gate. */
     cfg->corner_detection_mode = 0;     /* LISCIO_CORNER_IMMEDIATE (default) */
     cfg->corner_hard_angle_deg = 60.0;
+    cfg->enable_g1_chain       = 0;     /* legacy off; #2 dense-crawl opt-in */
+    cfg->prefer_bspline        = 0;     /* legacy off; #2 dense-crawl opt-in */
+    cfg->collapse_cusp_enable  = 1;     /* on: fold 2µm hard-corner thrash → 1 stop */
+    cfg->collapse_cusp_tol     = -1.0;  /* <=0 follows tol_xyz */
+    cfg->arc_g2fuse            = 0;     /* off: native arc passthrough (default) */
+    cfg->merge_same_feed_only  = 1;     /* on: an F change splits the window */
 }
 
 void liscio_cfg_set_corner_detection(liscio_cfg_t *cfg,
@@ -165,6 +201,10 @@ static void fill_common_fields(liscio_ctx_t *ctx, liscio_primitive_t *prim)
  * continuity.  Must be called by every emit_* path after ctx->cb. */
 static void cache_exit_tangent(liscio_ctx_t *ctx, const liscio_primitive_t *p)
 {
+    /* Break the G2 curvature chain by default: it is re-armed ONLY by the g2
+     * quintic branch right after this call.  So any non-quintic emit (line,
+     * cubic, arc, spline) ends the chain → its seam becomes a blend join. */
+    ctx->have_prev_emit_kappa = 0;
     double m = sqrt(p->tan_end_x*p->tan_end_x +
                     p->tan_end_y*p->tan_end_y +
                     p->tan_end_z*p->tan_end_z);
@@ -258,6 +298,7 @@ static void emit_bspline(liscio_ctx_t *ctx, int i0, int i1,
     prim.tag_line_last        = ctx->tag[i1];
     prim.tag_line_id          = prim.tag_line_first;
     prim.n_absorbed           = i1 - i0;
+    prim.from_arc_g2          = ctx->emitting_arc_g2 ? 1 : 0;
 
     /* Defaults: rational weights = 1, tol from cfg. */
     prim.w0 = prim.w1 = prim.w2 = prim.w3 = 1.0;
@@ -306,6 +347,46 @@ static void emit_bezier(liscio_ctx_t *ctx, int i0, int i1,
 {
     if (!ctx->cb) return;
     if (!fit || i0 < 0 || i1 < i0 || i1 >= ctx->n_pts) return;
+
+    /* G2 upgrade: try a κ=0 quintic that leaves/re-enters the neighbour straight
+     * segments with ZERO curvature, killing the centripetal-jerk step at the
+     * bezier↔line seam. The κ=0 constraint self-selects: it only meets tolerance
+     * where the data genuinely flattens at both ends (line-adjacent); a curve↔
+     * curve seam (κ≠0 at the end) busts tolerance and falls through to the cubic.
+     * Tangent directions come from the cubic fit, so G1 is preserved either way. */
+    /* C2 upgrade: a curvature-MATCHED quintic (κ≠0) — for curve/arc seams where
+     * the κ=0 quintic busts tolerance.  Pins the actual endpoint curvature
+     * (estimated from the osculating circles) so the fit follows a genuinely
+     * curved run without the κ=0 unbend-rebend ripple.  Tried FIRST (when
+     * enabled) since it is the general case; g2zero remains for pure line seams. */
+    if (ctx->cfg.enable_g2_curvature) {
+        double t1x=fit->P1.x-fit->P0.x, t1y=fit->P1.y-fit->P0.y, t1z=fit->P1.z-fit->P0.z;
+        double t2x=fit->P2.x-fit->P3.x, t2y=fit->P2.y-fit->P3.y, t2z=fit->P2.z-fit->P3.z;
+        liscio_bspline9_fit_t q;
+        if (liscio_quintic9_g2_fit(ctx, i0, i1, t1x,t1y,t1z, t2x,t2y,t2z, &q) == 0) {
+            emit_bspline(ctx, i0, i1, &q);   /* clears the G2 chain via cache_exit_tangent */
+            /* Re-arm the G2 chain: the NEXT window's g2 fit will pin its
+             * k_start to THIS curve's k_end → shared seam curvature = C2. */
+            ctx->prev_emit_kappa   = q.end_kappa;
+            ctx->prev_emit_norm_x  = q.end_norm_x;
+            ctx->prev_emit_norm_y  = q.end_norm_y;
+            ctx->prev_emit_norm_z  = q.end_norm_z;
+            ctx->have_prev_emit_kappa = 1;
+            ctx->stats.emitted_g2_quintic++;
+            return;
+        }
+    }
+
+    if (ctx->cfg.enable_g2_quintic) {
+        double t1x=fit->P1.x-fit->P0.x, t1y=fit->P1.y-fit->P0.y, t1z=fit->P1.z-fit->P0.z;
+        double t2x=fit->P2.x-fit->P3.x, t2y=fit->P2.y-fit->P3.y, t2z=fit->P2.z-fit->P3.z;
+        liscio_bspline9_fit_t q;
+        if (liscio_quintic9_g2zero_fit(ctx, i0, i1, t1x,t1y,t1z, t2x,t2y,t2z, &q) == 0) {
+            emit_bspline(ctx, i0, i1, &q);
+            ctx->stats.emitted_g2_quintic++;
+            return;
+        }
+    }
 
     liscio_primitive_t prim;
     memset(&prim, 0, sizeof(prim));
@@ -531,13 +612,42 @@ static void flush_window_as_primitive(liscio_ctx_t *ctx)
 
     int emitted = 0;
 
+    /* G1-CHAIN (opt-in): when a previous primitive's exit tangent is
+     * known, try a G1-constrained cubic Bezier across the WHOLE window
+     * first, so this primitive leaves the previous one tangentially
+     * (sub-degree boundary → no jerk-kink corner cap).  Gated on tol_xyz
+     * via fit_g1; a window that bends too hard for a single G1 cubic
+     * falls through to the normal ladder below (which still benefits from
+     * the preserved tangent in its own bezier path).  This is the core of
+     * the #2 dense-path smoothing fix. */
+    if (ctx->cfg.enable_g1_chain && ctx->have_prev_emit_tan
+        && ctx->n_pts >= 4 && ctx->cfg.enable_bezier)
+    {
+        int n = ctx->n_pts;
+        double dx = ctx->pts[n-2].x - ctx->pts[n-1].x;
+        double dy = ctx->pts[n-2].y - ctx->pts[n-1].y;
+        double dz = ctx->pts[n-2].z - ctx->pts[n-1].z;
+        double m = sqrt(dx*dx + dy*dy + dz*dz);
+        if (m > 1e-15) {
+            liscio_bezier9_fit_t bf;
+            int rc = liscio_bezier9_fit_g1(ctx, 0, ctx->n_pts - 1,
+                ctx->prev_emit_tan_x, ctx->prev_emit_tan_y, ctx->prev_emit_tan_z,
+                dx/m, dy/m, dz/m, &bf);
+            if (rc == 0) {
+                emit_bezier(ctx, 0, ctx->n_pts - 1, &bf);
+                emitted = 1;
+                liscio_dbg.bez_g1_used++;
+            }
+        }
+    }
+
     /* Strategy: try most-specific first (preserves CAM intent).
      *   0. LINE if all points colinear (degenerate cases)
      *   1. ARC (3-point circle; exact match for CAM-output G01 approx of arcs)
      *   2. BEZIER cubic (smooth curves, CAM tool-path splines)
      *   3. LINE fallback
      */
-    {
+    if (!emitted) {
         /* Linearity check: max perpendicular deviation from line pts[0]→pts[n-1]. */
         const liscio_pose_t *p0 = &ctx->pts[0];
         const liscio_pose_t *pN = &ctx->pts[ctx->n_pts - 1];
@@ -557,6 +667,7 @@ static void flush_window_as_primitive(liscio_ctx_t *ctx)
             if (max_perp < ctx->cfg.collinear_tol) {
                 emit_line(ctx, 0, ctx->n_pts - 1);
                 emitted = 1;
+                liscio_dbg.emit_line_collin++;
             }
         }
     }
@@ -579,6 +690,29 @@ static void flush_window_as_primitive(liscio_ctx_t *ctx)
             emitted = 1;
         }
     }
+    /* B-spline FIRST (opt-in via prefer_bspline): a C2 B-spline spreads a
+     * dense window's curvature so the RT centripetal-jerk cap does not
+     * throttle it to a crawl (the #2 dense-path fix).  Tried before Bezier;
+     * Bezier still catches windows the B-spline fitter rejects. */
+    if (!emitted && ctx->cfg.prefer_bspline && ctx->cfg.enable_bspline
+        && ctx->n_pts >= (ctx->cfg.bspline_init_ctrl > 4
+                           ? ctx->cfg.bspline_init_ctrl : 4))
+    {
+        int M_init = ctx->cfg.bspline_init_ctrl;
+        if (M_init < 4) M_init = 4;
+        if (M_init > LISCIO_BSPLINE_MAX_CTRL) M_init = LISCIO_BSPLINE_MAX_CTRL;
+        int M_cap = M_init + 4;
+        if (M_cap > LISCIO_BSPLINE_MAX_CTRL) M_cap = LISCIO_BSPLINE_MAX_CTRL;
+        for (int M = M_init; M <= M_cap && M <= ctx->n_pts; M += 4) {
+            liscio_bspline9_fit_t bs;
+            if (liscio_bspline9_fit(ctx, 0, ctx->n_pts - 1, M, &bs) == 0) {
+                emit_bspline(ctx, 0, ctx->n_pts - 1, &bs);
+                emitted = 1;
+                break;
+            }
+        }
+    }
+
     if (!emitted && ctx->n_pts >= 4 && ctx->cfg.enable_bezier) {
         /* Try simple single-fit first (fast path).  When a previous
          * primitive's exit tangent is available (cross-window G1), use
@@ -608,6 +742,7 @@ static void flush_window_as_primitive(liscio_ctx_t *ctx)
 #else
         (void)g1_tried;
 #endif
+        if (g1_tried) { if (rc == 0) liscio_dbg.bez_g1_used++; else liscio_dbg.bez_g1_miss++; }
         if (rc != 0) rc = liscio_bezier9_fit(ctx, 0, ctx->n_pts - 1, &bf);
         if (rc == 0) {
             emit_bezier(ctx, 0, ctx->n_pts - 1, &bf);
@@ -663,6 +798,23 @@ static void flush_window_as_primitive(liscio_ctx_t *ctx)
          * tol_xyz at interior waypoints. */
         for (int k = 0; k < ctx->n_pts - 1; k++) {
             emit_line(ctx, k, k + 1);
+            liscio_dbg.emit_line_fallback++;
+        }
+    }
+
+    /* TEMP debug: per-flush cumulative counter snapshot (flower bisect). */
+    if (getenv("TP2_FLUSHDBG")) {
+        FILE *ff = fopen("/tmp/tp2_flushdbg.log", "a");
+        if (ff) {
+            fprintf(ff, "flush npts=%d emitted=%d | corner=%ld disc=%ld maxwin=%ld feedchg=%ld final=%ld | coll=%ld fall=%ld g1u=%ld g1m=%ld absorb=%ld\n",
+                ctx->n_pts, emitted,
+                liscio_dbg.flush_corner, liscio_dbg.flush_disc,
+                liscio_dbg.flush_maxwin, liscio_dbg.flush_feedchg,
+                liscio_dbg.flush_final,
+                liscio_dbg.emit_line_collin, liscio_dbg.emit_line_fallback,
+                liscio_dbg.bez_g1_used, liscio_dbg.bez_g1_miss,
+                liscio_dbg.stream_absorb);
+            fclose(ff);
         }
     }
 
@@ -710,6 +862,7 @@ static int corner_level(const liscio_ctx_t *ctx,
 
 static void flush_pending_arc(liscio_ctx_t *ctx);
 static void flush_arc_helix_buffer(liscio_ctx_t *ctx);
+static void arcg2_flush_pending(liscio_ctx_t *ctx);
 
 int liscio_add_line(liscio_ctx_t *ctx,
                      const liscio_pose_t *start,
@@ -720,9 +873,39 @@ int liscio_add_line(liscio_ctx_t *ctx,
     if (!ctx || !start || !end) return -1;
     ctx->stats.input_count++;
 
-    /* G1 interrupts any pending arc-merge or arc-helix run. */
+    /* G1 interrupts any pending arc-merge / arc-helix / fusion run. */
     if (ctx->has_pending_arc) flush_pending_arc(ctx);
     if (ctx->arc_buf_n > 0)   flush_arc_helix_buffer(ctx);
+    if (ctx->has_arcg2_pend)  arcg2_flush_pending(ctx);
+
+    /* Micro-cusp cluster collapse: while inside a hard-corner thrash cluster,
+     * decimate points that stay within collapse_cusp_tol of the anchor — they
+     * are geometrically indistinct at that tolerance and each would otherwise
+     * force its own v=0 junction (N stops in a few µm → millions of jerk).
+     * Resume normal fitting when the path escapes the ball. */
+    if (ctx->in_cluster) {
+        double _ct = (ctx->cfg.collapse_cusp_tol > 0.0)
+                     ? ctx->cfg.collapse_cusp_tol : ctx->cfg.tol_xyz;
+        double dx = end->x - ctx->cluster_anchor.x;
+        double dy = end->y - ctx->cluster_anchor.y;
+        double dz = end->z - ctx->cluster_anchor.z;
+        if (dx*dx + dy*dy + dz*dz <= _ct * _ct)
+            return 0;                       /* decimate: drop this point */
+        /* Escaped the ball → cluster ends.  Append `end` to the anchored
+         * window ([anchor]) as the single exit segment: the anchor becomes
+         * ONE junction (v=0 when the net turn across the cluster is sharp)
+         * for the whole collapsed thrash region.  Bypass the continuity
+         * check — `start` no longer matches the anchor (intermediate points
+         * were decimated). */
+        ctx->in_cluster = 0;
+        if (ctx->n_pts < LISCIO_MAX_WINDOW) {
+            ctx->pts[ctx->n_pts]  = *end;
+            ctx->feed[ctx->n_pts] = feedrate;
+            ctx->tag[ctx->n_pts]  = tag_line_id;
+            ctx->n_pts++;
+        }
+        return 0;
+    }
 
     /* Seed window on first call or after reset/flush. */
     if (ctx->n_pts == 0) {
@@ -743,6 +926,7 @@ int liscio_add_line(liscio_ctx_t *ctx,
              * tangent and mark the next emission as a new run: the
              * caller probably skipped a G0 rapid without calling
              * liscio_mark_stop. */
+            liscio_dbg.flush_disc++;
             flush_window_as_primitive(ctx);
             ctx->have_prev_emit_tan  = 0;
             ctx->pts[0]  = *start;
@@ -767,78 +951,125 @@ int liscio_add_line(liscio_ctx_t *ctx,
             do_flush = (ctx->cfg.corner_detection_mode
                        != LISCIO_CORNER_LOOKAHEAD);     /* soft in legacy mode */
         }
+        /* Micro-cusp cluster entry: a HARD corner between two sub-tolerance
+         * segments is direction thrashing at the resolution floor.  Flush the
+         * clean pre-cluster geometry once, then enter collapse mode so the
+         * whole thrash region folds into a single stop junction instead of
+         * one v=0 junction per corner. */
+        int enter_cluster = 0;
+        if (do_flush && level >= 2 && ctx->cfg.collapse_cusp_enable
+            && ctx->n_pts >= 2) {
+            double _ct = (ctx->cfg.collapse_cusp_tol > 0.0)
+                         ? ctx->cfg.collapse_cusp_tol : ctx->cfg.tol_xyz;
+            int n = ctx->n_pts;
+            double ax = ctx->pts[n-1].x - ctx->pts[n-2].x;
+            double ay = ctx->pts[n-1].y - ctx->pts[n-2].y;
+            double az = ctx->pts[n-1].z - ctx->pts[n-2].z;
+            double bx = end->x - ctx->pts[n-1].x;
+            double by = end->y - ctx->pts[n-1].y;
+            double bz = end->z - ctx->pts[n-1].z;
+            if (ax*ax + ay*ay + az*az < _ct * _ct &&
+                bx*bx + by*by + bz*bz < _ct * _ct)
+                enter_cluster = 1;
+        }
         if (do_flush) {
+            liscio_dbg.flush_corner++;
             flush_window_as_primitive(ctx);
             ctx->have_prev_emit_tan = 0;   /* corner is G1 discontinuity */
             /* After flush, n_pts = 1 with last waypoint = corner pt. */
         }
+        if (enter_cluster) {
+            ctx->in_cluster     = 1;
+            ctx->cluster_anchor = ctx->pts[0];   /* = the corner point */
+            return 0;                            /* decimate current `end` */
+        }
     }
 
-    /* Long-segment isolation.  CAM "stay-down" transitions emit a single
-     * G1 spanning many millimetres while surrounding cuts are micro-
-     * segments.  If liscio bundles a long segment with surrounding short
-     * segments into one bezier window, the LSQ fit is unconstrained
-     * between the long endpoints (no raw waypoint to anchor it) and the
-     * curve drifts — visually showing a phantom path far from the chord.
-     *
-     * Two check directions, both triggering "flush + emit long as LINE":
-     *   (a) NEW segment is >5× the average of segments already in window
-     *       — outlier arrives after a smooth run.
-     *   (b) The MOST-RECENT segment in window is >5× the new segment
-     *       — an outlier arrived first, now a normal segment follows; we
-     *       need to emit the prior long segment as its own LINE before
-     *       continuing.  This is the common pattern for stay-down
-     *       transitions where the long G1 starts a new fitting window. */
-    int isolate_long_new  = 0;     /* (a) */
-    int isolate_long_prev = 0;     /* (b) */
-    double new_len = 0;
-    if (ctx->n_pts >= 2) {
-        const liscio_pose_t *prev = &ctx->pts[ctx->n_pts - 1];
-        double sx = end->x - prev->x;
-        double sy = end->y - prev->y;
-        double sz = end->z - prev->z;
-        new_len = sqrt(sx*sx + sy*sy + sz*sz);
-        double sum_chord = 0;
-        double last_len = 0;
-        for (int i = 1; i < ctx->n_pts; i++) {
-            double dx = ctx->pts[i].x - ctx->pts[i-1].x;
-            double dy = ctx->pts[i].y - ctx->pts[i-1].y;
-            double dz = ctx->pts[i].z - ctx->pts[i-1].z;
-            double len = sqrt(dx*dx + dy*dy + dz*dz);
-            sum_chord += len;
-            last_len = len;   /* most-recent segment = pts[n-2]→pts[n-1] */
+    /* Same-F merge gate (cfg.merge_same_feed_only, default on).  A fitted
+     * primitive carries ONE feedrate (prim.feedrate = feed of the window's
+     * first segment), so a window may only span segments that share F: an
+     * F change flushes the accumulated (all-old-F) window and the incoming
+     * segment starts a fresh window under the new F.  Runs AFTER corner
+     * detection so a corner+F-change junction keeps its corner handling
+     * (flush + tangent clear); a pure F change is not a geometric break,
+     * so the cross-flush tangent survives (same as a maxwin flush). */
+    if (ctx->cfg.merge_same_feed_only && ctx->n_pts >= 1
+        && !feed_match(ctx->feed[ctx->n_pts - 1], feedrate)) {
+        if (getenv("TP2_FLUSHDBG")) {   /* TEMP: flower bisect */
+            FILE *ff = fopen("/tmp/tp2_feedchg.log", "a");
+            if (ff) { fprintf(ff, "feedchg stored=%.9f incoming=%.9f npts=%d\n",
+                              ctx->feed[ctx->n_pts - 1], feedrate, ctx->n_pts); fclose(ff); }
         }
-        double avg = sum_chord / (double)(ctx->n_pts - 1);
-        if (avg > 0 && new_len > 5.0 * avg && new_len > 5.0 * ctx->cfg.tol_xyz)
-            isolate_long_new = 1;
-        if (last_len > 5.0 * new_len && last_len > 5.0 * ctx->cfg.tol_xyz
-            && new_len > 0)
-            isolate_long_prev = 1;
+        if (ctx->n_pts >= 2) {
+            liscio_dbg.flush_feedchg++;
+            flush_window_as_primitive(ctx);   /* keeps last pt as seed */
+        }
+        /* Re-label the seed waypoint: it only anchors the incoming segment,
+         * whose feedrate rules the window now starting (the seed's stored
+         * feed is the PREVIOUS run's F — emitting it would mis-feed the
+         * first segment after every F-change or flush boundary). */
+        ctx->feed[0] = feedrate;
     }
-    if (isolate_long_prev) {
-        /* The window's most-recent segment is an outlier.  Flush window
-         * (which contains [..., prev_outlier_start, prev_outlier_end]) so
-         * it emits the outlier (and any earlier short-segment run before
-         * it).  Continue normally to append the new short endpoint.
-         * Long stay-down is rapid-like — clear cross-flush tangent. */
-        flush_window_as_primitive(ctx);
-        ctx->have_prev_emit_tan = 0;
-        /* fall through to normal append below */
-    } else if (isolate_long_new) {
-        flush_window_as_primitive(ctx);
-        ctx->have_prev_emit_tan = 0;
-        ctx->pts[ctx->n_pts]  = *end;
-        ctx->feed[ctx->n_pts] = feedrate;
-        ctx->tag[ctx->n_pts]  = tag_line_id;
-        ctx->n_pts++;
-        flush_window_as_primitive(ctx);
-        ctx->have_prev_emit_tan = 0;
-        return 0;
+
+    /* Streaming collinear absorption (header: collinear_tol).  Extend the
+     * last chord pts[n-2]→pts[n-1] to pts[n-2]→end when the abandoned
+     * waypoint stays inside tol of the new chord.  Cuts µm G1 junction
+     * count (130207LZW engraving) without touching arc_g2fuse (add_arc).
+     * Gates: same sense (no reverse), Z/W peck not reversed, feed match. */
+    if (ctx->n_pts >= 2) {
+        const liscio_pose_t *p0 = &ctx->pts[ctx->n_pts - 2];
+        const liscio_pose_t *p1 = &ctx->pts[ctx->n_pts - 1];
+        double ax = p1->x - p0->x, ay = p1->y - p0->y, az = p1->z - p0->z;
+        double aw = p1->w - p0->w;
+        double bx = end->x - p1->x, by = end->y - p1->y, bz = end->z - p1->z;
+        double bw = end->w - p1->w;
+        double la = sqrt(ax * ax + ay * ay + az * az);
+        double lb = sqrt(bx * bx + by * by + bz * bz);
+        double ctol = ctx->cfg.collinear_tol;
+        if (ctol <= 0.0) ctol = ctx->cfg.tol_xyz;
+        /* 6.6.135: a 0.01 cap left flower Y=121 12 µm XZ bows as
+         * LINEAR wraps (rec-129-fls +81k) even though G64 P=0.05 and
+         * g1_chain already trust that band.  LZW P=0.005 stays 5 µm.
+         * Ceiling 0.05 so looser-than-flower G64 cannot eat visible
+         * bends.  same_dir still ~8°.  Do not reopen 128–134. */
+        if (ctol > 0.05) ctol = 0.05;
+        if (la > 1e-15 && lb > 1e-15 && ctol > 0.0) {
+            double dot = (ax * bx + ay * by + az * bz) / (la * lb);
+            /* ~8° — below IMMEDIATE soft-corner flush (15°); path still
+             * gated by collinear_tol / ctol so G64 P is respected. */
+            int same_dir = (dot > 0.99);
+            const double peck_eps = 1e-6;
+            int z_rev = (fabs(az) > peck_eps && fabs(bz) > peck_eps && az * bz < 0.0);
+            int w_rev = (fabs(aw) > peck_eps && fabs(bw) > peck_eps && aw * bw < 0.0);
+            double fprev = ctx->feed[ctx->n_pts - 1];
+            int feed_ok = (fprev <= 0.0 || feedrate <= 0.0
+                           || fabs(fprev - feedrate) < 1e-9 * fmax(1.0, fabs(fprev)));
+            if (same_dir && !z_rev && !w_rev && feed_ok) {
+                double cx = end->x - p0->x, cy = end->y - p0->y, cz = end->z - p0->z;
+                double lc2 = cx * cx + cy * cy + cz * cz;
+                double vx = p1->x - p0->x, vy = p1->y - p0->y, vz = p1->z - p0->z;
+                double t = (lc2 > 1e-30) ? (vx * cx + vy * cy + vz * cz) / lc2 : 0.0;
+                if (t < 0.0) t = 0.0;
+                else if (t > 1.0) t = 1.0;
+                double qx = p0->x + t * cx - p1->x;
+                double qy = p0->y + t * cy - p1->y;
+                double qz = p0->z + t * cz - p1->z;
+                double dev = sqrt(qx * qx + qy * qy + qz * qz);
+                if (dev <= ctol) {
+                    ctx->pts[ctx->n_pts - 1]  = *end;
+                    ctx->feed[ctx->n_pts - 1] = feedrate;
+                    ctx->tag[ctx->n_pts - 1]  = tag_line_id;
+                    liscio_dbg.stream_absorb++;
+                    return 0;
+                }
+            }
+        }
     }
 
     /* Append new endpoint. */
     if (ctx->n_pts >= ctx->cfg.max_window) {
         /* Window full — flush and re-seed. */
+        liscio_dbg.flush_maxwin++;
         flush_window_as_primitive(ctx);
     }
 
@@ -1178,6 +1409,317 @@ static int arcs_mergeable(const liscio_primitive_t *a,
     return 1;
 }
 
+/* ==================================================================
+ *  Arc-chain G2 spline fusion  (cfg.arc_g2fuse)
+ * ==================================================================
+ * Emit ONE G2/G3 arc as an ANALYTIC C2 quintic (or, on a wide sweep or a
+ * curvature-mismatched seam, a bisected run of quintics), reusing the
+ * validated liscio_quintic9_g2_fit direct-construction + tolerance gate.
+ *
+ * Unlike arc_subseg_samples (which samples arcs into LINE chords pushed
+ * through the G1 LSQ pipeline — injecting curvature noise → ripple), this
+ * samples the EXACT circle into the fit's check window and relies on the
+ * fit pinning the EXACT κ=1/R (est_endpoint_kappa on 3 exact circle points
+ * = 1/R; a chained arc's start κ is pinned to the neighbour via the ctx G2
+ * chain).  The quintic therefore follows the TRUE arc, and consecutive
+ * tangent-continuous arcs share seam curvature (C2) → no curvature step →
+ * no velocity hunting.  A real corner or turn-sign flip breaks the chain so
+ * the seam falls to a blend join. */
+
+/* Reconstructed arc geometry, mirroring PmCircle / pmCirclePoint so SPIRAL
+ * (radius growth) and HELIX (axial advance) are reproduced exactly — thomam's
+ * "arcs" are expanding spirals, so a constant-R circle is badly wrong. */
+typedef struct {
+    double C[3];        /* center                                   */
+    double rtan[3];     /* start radial (= start − center), |·| = R0 */
+    double rperp[3];    /* n × rtan (same magnitude R0, CCW dir)     */
+    double R0;          /* start radius                             */
+    double spiral;      /* Rend − R0 (total radial growth)          */
+    double hvec[3];     /* total axial (helix) vector = ((E−S)·n)·n */
+    double phi;         /* signed total sweep (arc_angle)           */
+    /* endpoint ABC/UVW for linear interpolation */
+    liscio_pose_t s, e;
+} arc_geom_t;
+
+/* Exact pose on the arc at fraction `frac` ∈ [0,1], mirroring pmCirclePoint:
+ * base = rtan·cos(a) + rperp·sin(a) (|·|=R0), then add unit(base)·scale·spiral
+ * (spiral growth) + hvec·scale (helix), scale = frac.  ABC/UVW interpolate
+ * linearly. */
+static void arc_pose_at(const arc_geom_t *g, double frac, liscio_pose_t *out)
+{
+    double a  = frac * g->phi;
+    double ca = cos(a), sa = sin(a);
+    double base[3];
+    base[0] = g->rtan[0]*ca + g->rperp[0]*sa;
+    base[1] = g->rtan[1]*ca + g->rperp[1]*sa;
+    base[2] = g->rtan[2]*ca + g->rperp[2]*sa;
+    double bm = sqrt(base[0]*base[0] + base[1]*base[1] + base[2]*base[2]);
+    double grow = (bm > 1e-15) ? (frac * g->spiral / bm) : 0.0;  /* unit(base)·scale·spiral */
+    out->x = g->C[0] + base[0]*(1.0 + grow) + frac*g->hvec[0];
+    out->y = g->C[1] + base[1]*(1.0 + grow) + frac*g->hvec[1];
+    out->z = g->C[2] + base[2]*(1.0 + grow) + frac*g->hvec[2];
+    out->a = g->s.a + frac*(g->e.a - g->s.a);
+    out->b = g->s.b + frac*(g->e.b - g->s.b);
+    out->c = g->s.c + frac*(g->e.c - g->s.c);
+    out->u = g->s.u + frac*(g->e.u - g->s.u);
+    out->v = g->s.v + frac*(g->e.v - g->s.v);
+    out->w = g->s.w + frac*(g->e.w - g->s.w);
+}
+
+/* Unit FORWARD tangent at fraction `frac`, by central finite difference of
+ * arc_pose_at — robust for spiral + helix without hand-derived derivatives. */
+static void arc_tan_at(const arc_geom_t *g, double frac, double t[3])
+{
+    double h = 1e-5;
+    double f0 = frac - h, f1 = frac + h;
+    if (f0 < 0.0) { f0 = 0.0; f1 = 2.0*h; }
+    if (f1 > 1.0) { f1 = 1.0; f0 = 1.0 - 2.0*h; }
+    liscio_pose_t p0, p1;
+    arc_pose_at(g, f0, &p0);
+    arc_pose_at(g, f1, &p1);
+    t[0] = p1.x - p0.x; t[1] = p1.y - p0.y; t[2] = p1.z - p0.z;
+    double m = sqrt(t[0]*t[0] + t[1]*t[1] + t[2]*t[2]);
+    if (m > 1e-15) { t[0]/=m; t[1]/=m; t[2]/=m; }
+}
+
+#define ARCG2_M         16   /* exact-arc check points per quintic fit */
+#define ARCG2_MAXDEPTH   7   /* bisection floor → native sub-arc fallback */
+
+int liscio_arc_g2_burst_bound(void)
+{
+    /* Full bisection tree of depth ARCG2_MAXDEPTH = 2^MAXDEPTH leaves, each
+     * emitting one primitive (quintic fit or native sub-arc floor). */
+    return 1 << ARCG2_MAXDEPTH;
+}
+
+/* Recursively emit the arc range [f0,f1] as one quintic; bisect on fit miss.
+ * t1o/teo (nullable): forward-tangent OVERRIDES applied at the arc's own outer
+ * endpoints (f=0 / f=1) — used to absorb a soft seam kink by handing both
+ * sides of the seam the AVERAGED tangent.  Interior bisection endpoints always
+ * use the exact arc tangent. */
+static void arc_g2_emit_range(liscio_ctx_t *ctx, const liscio_primitive_t *arc,
+                              const arc_geom_t *g,
+                              double feed, int tag, double f0, double f1, int depth,
+                              const double *t1o, const double *teo)
+{
+    for (int i = 0; i < ARCG2_M; i++) {
+        double fr = f0 + (f1 - f0) * ((double)i / (ARCG2_M - 1));
+        arc_pose_at(g, fr, &ctx->pts[i]);
+        ctx->feed[i] = feed;
+        ctx->tag[i]  = tag;
+    }
+    ctx->n_pts = ARCG2_M;
+
+    double t1[3], te[3];
+    if (t1o && f0 <= 0.0) { t1[0]=t1o[0]; t1[1]=t1o[1]; t1[2]=t1o[2]; }
+    else arc_tan_at(g, f0, t1);
+    if (teo && f1 >= 1.0) { te[0]=teo[0]; te[1]=teo[1]; te[2]=teo[2]; }
+    else arc_tan_at(g, f1, te);   /* forward end tangent */
+
+    liscio_bspline9_fit_t q;
+    /* quintic t2 convention = INWARD at the end (= −forward). */
+    if (liscio_quintic9_g2_fit(ctx, 0, ARCG2_M - 1,
+                               t1[0], t1[1], t1[2],
+                               -te[0], -te[1], -te[2], &q) == 0) {
+        emit_bspline(ctx, 0, ARCG2_M - 1, &q);   /* clears G2 chain */
+        ctx->prev_emit_kappa   = q.end_kappa;    /* re-arm: next fit pins to this κ */
+        ctx->prev_emit_norm_x  = q.end_norm_x;
+        ctx->prev_emit_norm_y  = q.end_norm_y;
+        ctx->prev_emit_norm_z  = q.end_norm_z;
+        ctx->have_prev_emit_kappa = 1;
+        ctx->stats.emitted_g2_quintic++;
+        return;
+    }
+
+    if (depth >= ARCG2_MAXDEPTH) {
+        /* Pinned C2 from a struggling neighbor can reject a circular leaf
+         * that would otherwise fit.  Native fallback is a few-cycle
+         * TC_CIRCULAR whose independent scatti then sign-flips through the
+         * wrap (thomam.random X −55k; const same seam already ~48k).  Unpin
+         * and retry: the leaf stays a quintic so the G2 blend can join. */
+        ctx->have_prev_emit_kappa = 0;
+        if (liscio_quintic9_g2_fit(ctx, 0, ARCG2_M - 1,
+                                   t1[0], t1[1], t1[2],
+                                   -te[0], -te[1], -te[2], &q) == 0) {
+            emit_bspline(ctx, 0, ARCG2_M - 1, &q);
+            ctx->prev_emit_kappa   = q.end_kappa;
+            ctx->prev_emit_norm_x  = q.end_norm_x;
+            ctx->prev_emit_norm_y  = q.end_norm_y;
+            ctx->prev_emit_norm_z  = q.end_norm_z;
+            ctx->have_prev_emit_kappa = 1;
+            ctx->stats.emitted_g2_quintic++;
+            return;
+        }
+        ctx->have_prev_emit_kappa = 0;
+        /* Floor: a native TC_CIRCULAR of this leftover is a 4-cycle
+         * independent scatti whose wrap sign-flips axis jerk (thomam
+         * X −55k).  The span was already judged too small/bent for a
+         * quintic — emit the chord.  cache_exit_tangent breaks C2 so
+         * curve_corner can G2-blend both ends (circular neighbors are
+         * excluded from that path). */
+        emit_line(ctx, 0, ARCG2_M - 1);
+        return;
+    }
+
+    double mid = 0.5 * (f0 + f1);
+    arc_g2_emit_range(ctx, arc, g, feed, tag, f0, mid, depth + 1, t1o, teo);
+    arc_g2_emit_range(ctx, arc, g, feed, tag, mid, f1, depth + 1, t1o, teo);
+}
+
+/* Reconstruct exact PmCircle geometry (spiral + helix) from an ARC primitive.
+ * Returns 0 on success, -1 degenerate (caller should fall back to a line). */
+static int arc_g2_geom_init(const liscio_primitive_t *arc, arc_geom_t *g)
+{
+    if (fabs(arc->arc_angle) < 1e-9) return -1;
+    g->C[0] = arc->cx; g->C[1] = arc->cy; g->C[2] = arc->cz;
+    g->rtan[0] = arc->start.x - arc->cx;
+    g->rtan[1] = arc->start.y - arc->cy;
+    g->rtan[2] = arc->start.z - arc->cz;
+    g->R0 = sqrt(g->rtan[0]*g->rtan[0] + g->rtan[1]*g->rtan[1] + g->rtan[2]*g->rtan[2]);
+    if (g->R0 < 1e-12) return -1;
+    /* rperp = n × rtan  (magnitude R0, CCW about n) */
+    g->rperp[0] = arc->ny*g->rtan[2] - arc->nz*g->rtan[1];
+    g->rperp[1] = arc->nz*g->rtan[0] - arc->nx*g->rtan[2];
+    g->rperp[2] = arc->nx*g->rtan[1] - arc->ny*g->rtan[0];
+    /* axial (helix) total = ((E−S)·n)·n */
+    double h = (arc->end.x - arc->start.x)*arc->nx
+             + (arc->end.y - arc->start.y)*arc->ny
+             + (arc->end.z - arc->start.z)*arc->nz;
+    g->hvec[0] = h*arc->nx; g->hvec[1] = h*arc->ny; g->hvec[2] = h*arc->nz;
+    /* end radius (in-plane) → spiral growth */
+    double ex = arc->end.x - arc->cx, ey = arc->end.y - arc->cy, ez = arc->end.z - arc->cz;
+    double edotn = ex*arc->nx + ey*arc->ny + ez*arc->nz;
+    double eip[3] = { ex - edotn*arc->nx, ey - edotn*arc->ny, ez - edotn*arc->nz };
+    double Rend = sqrt(eip[0]*eip[0] + eip[1]*eip[1] + eip[2]*eip[2]);
+    g->spiral = Rend - g->R0;
+    g->phi = arc->arc_angle;
+    g->s = arc->start;
+    g->e = arc->end;
+    return 0;
+}
+
+/* Emit one arc as fused C2 quintic(s).  t1o/teo (nullable) are forward-tangent
+ * overrides at the arc's outer endpoints — the seam-kink absorption handshake
+ * (both sides of a soft-kink seam receive the same averaged tangent).  Breaks
+ * the G2 chain at a real corner / turn-sign flip before emitting so a wrong
+ * pin never crosses a seam. */
+static void arc_g2_emit_one(liscio_ctx_t *ctx,
+                            const liscio_primitive_t *arc,
+                            double feed, int tag,
+                            const double *t1o, const double *teo)
+{
+    arc_geom_t g;
+    if (arc_g2_geom_init(arc, &g) != 0) {
+        liscio_add_line(ctx, &arc->start, &arc->end, feed, tag);
+        return;
+    }
+
+    if (getenv("TP2_ARCG2_DBG")) {
+        static int c = 0;
+        if (c++ < 30) {
+            liscio_pose_t pe; arc_pose_at(&g, 1.0, &pe);
+            double dx = pe.x - arc->end.x, dy = pe.y - arc->end.y, dz = pe.z - arc->end.z;
+            FILE *df = fopen("/tmp/tp2_arcg2.log", "a");
+            if (df) { fprintf(df, "arc R0=%.4f spiral=%.5f phi=%.4f  reconErr(end)=%.3e kink1=%d\n",
+                        g.R0, g.spiral, g.phi, sqrt(dx*dx+dy*dy+dz*dz), t1o!=NULL); fclose(df); }
+        }
+    }
+
+    /* Chain-break at the arc START: a tangent discontinuity (real corner) or a
+     * turn-sign flip (S-curve seam — start principal normal reverses) makes the
+     * C2 pin invalid → break so the seam gets a blend join.  Uses the EFFECTIVE
+     * start tangent (averaged override when absorbing a soft kink). */
+    if (ctx->have_prev_emit_kappa && ctx->have_prev_emit_tan) {
+        double t1[3];
+        if (t1o) { t1[0]=t1o[0]; t1[1]=t1o[1]; t1[2]=t1o[2]; }
+        else arc_tan_at(&g, 0.0, t1);
+        double dot  = t1[0]*ctx->prev_emit_tan_x
+                    + t1[1]*ctx->prev_emit_tan_y
+                    + t1[2]*ctx->prev_emit_tan_z;
+        double cmin = cos(ctx->cfg.corner_angle_deg * M_PI / 180.0);
+        /* start principal normal (toward centre) = −unit(rtan) */
+        double ndot = -(g.rtan[0]*ctx->prev_emit_norm_x
+                      + g.rtan[1]*ctx->prev_emit_norm_y
+                      + g.rtan[2]*ctx->prev_emit_norm_z) / g.R0;
+        if (dot < cmin || ndot < 0.0) ctx->have_prev_emit_kappa = 0;
+    }
+
+    ctx->emitting_arc_g2 = 1;
+    arc_g2_emit_range(ctx, arc, &g, feed, tag, 0.0, 1.0, 0, t1o, teo);
+    ctx->emitting_arc_g2 = 0;
+}
+
+/* Flush the arc-chain fusion pending arc (if any): emit it with its stored
+ * start-tangent override (from a previous soft-kink seam) and its OWN exact
+ * end tangent (no successor to average with). */
+static void arcg2_flush_pending(liscio_ctx_t *ctx)
+{
+    if (!ctx->has_arcg2_pend) return;
+    ctx->has_arcg2_pend = 0;   /* clear FIRST: emit path may re-enter flush */
+    arc_g2_emit_one(ctx, &ctx->arcg2_pend,
+                    ctx->arcg2_pend_feed, ctx->arcg2_pend_tag,
+                    ctx->arcg2_pend_has_t1 ? ctx->arcg2_pend_t1 : NULL, NULL);
+    ctx->arcg2_pend_has_t1 = 0;
+    /* The emit SCRIBBLED the shared pts[] window (quintic fit check points).
+     * Callers like liscio_add_line flush the pending arc BEFORE appending
+     * their own point — without this reset those 16 arc samples would be
+     * mistaken for window waypoints (measured: pathlen +200mm, ghost fits,
+     * 4e10 jerk).  Empty window: the next G1 line starts a fresh run. */
+    ctx->n_pts = 0;
+}
+
+/* Arc-chain fusion entry: hold the arc until its successor is known, so a soft
+ * seam kink (tangent break ≤ corner_angle_deg — thomam: 26 seams of 1-19°) is
+ * ABSORBED by handing both sides the averaged seam tangent (fit tolerance gate
+ * rejects kinks too big to absorb → bisect → native).  Without this every kink
+ * seam falls to a corner blend whose dκ/ds-dominated cap (~21 mm/s) wrecks
+ * feed holding (thomam fused: 51% of time stuck at 20-45 mm/s).  A feed change
+ * or a hard corner emits the pending arc as-is (seam falls to blend/kink cap). */
+static void liscio_arc_g2_add(liscio_ctx_t *ctx,
+                              const liscio_primitive_t *arc,
+                              double feed, int tag)
+{
+    if (ctx->has_arcg2_pend) {
+        arc_geom_t gp, gn;
+        int soft = 0;
+        double tm[3] = {0,0,0};
+        if (fabs(feed - ctx->arcg2_pend_feed) < 1e-9
+            && arc_g2_geom_init(&ctx->arcg2_pend, &gp) == 0
+            && arc_g2_geom_init(arc, &gn) == 0) {
+            double ta[3], tb[3];
+            arc_tan_at(&gp, 1.0, ta);   /* pending exit tangent  */
+            arc_tan_at(&gn, 0.0, tb);   /* new     entry tangent */
+            double dot = ta[0]*tb[0] + ta[1]*tb[1] + ta[2]*tb[2];
+            double cmin = cos(ctx->cfg.corner_angle_deg * M_PI / 180.0);
+            if (dot > cmin) {
+                tm[0] = ta[0] + tb[0]; tm[1] = ta[1] + tb[1]; tm[2] = ta[2] + tb[2];
+                double m = sqrt(tm[0]*tm[0] + tm[1]*tm[1] + tm[2]*tm[2]);
+                if (m > 1e-12) { tm[0]/=m; tm[1]/=m; tm[2]/=m; soft = 1; }
+            }
+        }
+        /* Emit the pending arc: averaged exit tangent on a soft seam, own exact
+         * tangent otherwise. */
+        int had_t1 = ctx->arcg2_pend_has_t1;
+        double t1s[3] = { ctx->arcg2_pend_t1[0], ctx->arcg2_pend_t1[1], ctx->arcg2_pend_t1[2] };
+        ctx->has_arcg2_pend = 0;
+        ctx->arcg2_pend_has_t1 = 0;
+        arc_g2_emit_one(ctx, &ctx->arcg2_pend,
+                        ctx->arcg2_pend_feed, ctx->arcg2_pend_tag,
+                        had_t1 ? t1s : NULL, soft ? tm : NULL);
+        /* The new arc inherits the averaged tangent as ITS start override. */
+        if (soft) {
+            ctx->arcg2_pend_t1[0] = tm[0];
+            ctx->arcg2_pend_t1[1] = tm[1];
+            ctx->arcg2_pend_t1[2] = tm[2];
+            ctx->arcg2_pend_has_t1 = 1;
+        }
+    }
+    ctx->arcg2_pend      = *arc;
+    ctx->arcg2_pend_feed = feed;
+    ctx->arcg2_pend_tag  = tag;
+    ctx->has_arcg2_pend  = 1;
+}
+
 int liscio_add_arc(liscio_ctx_t *ctx,
                     const liscio_primitive_t *arc,
                     double feedrate,
@@ -1238,6 +1780,21 @@ int liscio_add_arc(liscio_ctx_t *ctx,
         return 0;
     }
 
+    /* Arc-chain G2 fusion: emit the arc as analytic C2 quintic(s) so a run of
+     * tangent-continuous arcs becomes one curvature-continuous spline chain
+     * (no per-seam curvature step); soft seam kinks are absorbed via the
+     * one-arc pending buffer (averaged seam tangent).  Drain any pending G1
+     * line window first. */
+    if (ctx->cfg.arc_g2fuse) {
+        flush_window_as_primitive(ctx);
+        liscio_arc_g2_add(ctx, arc, feedrate, tag_line_id);
+        ctx->pts[0]  = arc->end;   /* seed window for a following G1 run */
+        ctx->feed[0] = feedrate;
+        ctx->tag[0]  = tag_line_id;
+        ctx->n_pts   = 1;
+        return 0;
+    }
+
     /* G2/G3 passes through: flush pending G1 window first. */
     flush_window_as_primitive(ctx);
 
@@ -1262,7 +1819,11 @@ int liscio_add_arc(liscio_ctx_t *ctx,
             const liscio_primitive_t *prev = &ctx->arc_buf[ctx->arc_buf_n - 1];
             double radius_tol = ctx->cfg.tol_xyz;
             double xy_tol     = ctx->cfg.tol_xyz;
-            if (arc_helix_admissible(prev, arc, radius_tol, xy_tol)
+            /* Same-F gate: a merged primitive carries one feedrate. */
+            int feed_ok = !ctx->cfg.merge_same_feed_only
+                          || feed_match(ctx->arc_buf_feed, feedrate);
+            if (feed_ok
+                && arc_helix_admissible(prev, arc, radius_tol, xy_tol)
                 && ctx->arc_buf_n < cap)
             {
                 ctx->arc_buf[ctx->arc_buf_n]                 = *arc;
@@ -1290,9 +1851,13 @@ int liscio_add_arc(liscio_ctx_t *ctx,
         return 0;
     }
 
-    /* Arc-merge mode: try to extend a buffered prior arc. */
+    /* Arc-merge mode: try to extend a buffered prior arc.  Same-F gate: a
+     * merged primitive carries one feedrate, so an F change breaks the run
+     * (flush pending, buffer the new arc) exactly like a geometry break. */
     if (ctx->cfg.arc_merge_mode != LISCIO_ARC_MERGE_OFF) {
         if (ctx->has_pending_arc &&
+            (!ctx->cfg.merge_same_feed_only
+             || feed_match(ctx->pending_feed, feedrate)) &&
             arcs_mergeable(&ctx->pending_arc, arc,
                            ctx->cfg.arc_merge_xy_tol,
                            ctx->cfg.arc_merge_pitch_tol))
@@ -1340,22 +1905,40 @@ int liscio_add_arc(liscio_ctx_t *ctx,
 void liscio_flush(liscio_ctx_t *ctx)
 {
     if (!ctx) return;
+    ctx->in_cluster = 0;
     if (ctx->n_pts >= 2)
         flush_window_as_primitive(ctx);
     ctx->n_pts = 0;
     flush_pending_arc(ctx);
     flush_arc_helix_buffer(ctx);
+    arcg2_flush_pending(ctx);
+}
+
+/* Flush ONLY the pending G1 line window (arc-chain fusion helper).  The tp2
+ * bridge calls this before switching modal from lines to an arc so the fitted
+ * lines emit under the correct (line) modal — WITHOUT emitting the fusion
+ * pending arc, whose seam-tangent handshake with the NEXT arc must survive
+ * across consecutive liscio_add_arc calls. */
+void liscio_flush_lines(liscio_ctx_t *ctx)
+{
+    if (!ctx) return;
+    ctx->in_cluster = 0;
+    if (ctx->n_pts >= 2)
+        flush_window_as_primitive(ctx);
+    ctx->n_pts = 0;
 }
 
 /* ------------------------------------------------------------------ */
 /* Internal: drain pending state before injecting a passthrough event. */
 static void drain_pending(liscio_ctx_t *ctx)
 {
+    ctx->in_cluster = 0;           /* an injected event breaks the cluster */
     if (ctx->n_pts >= 2)
         flush_window_as_primitive(ctx);
     ctx->n_pts = 0;
     flush_pending_arc(ctx);
     flush_arc_helix_buffer(ctx);
+    arcg2_flush_pending(ctx);
     ctx->have_prev_emit_tan = 0;   /* tangent broken across event */
 }
 
@@ -1439,6 +2022,44 @@ void liscio_reset(liscio_ctx_t *ctx)
     if (!ctx) return;
     ctx->n_pts = 0;
     ctx->have_prev_emit_tan = 0;
+    ctx->have_prev_emit_kappa = 0;
+    ctx->prev_emit_kappa = 0.0;
+    ctx->prev_emit_norm_x = ctx->prev_emit_norm_y = ctx->prev_emit_norm_z = 0.0;
     ctx->has_pending_arc = 0;
+    ctx->pending_n_absorbed = 0;
+    ctx->in_cluster = 0;
+    /* Drop fusion pendings without emit — program boundary / abort. */
+    ctx->arc_buf_n = 0;
+    ctx->has_arcg2_pend = 0;
+    ctx->arcg2_pend_has_t1 = 0;
+    ctx->emitting_arc_g2 = 0;
     memset(&ctx->stats, 0, sizeof(ctx->stats));
+}
+
+void liscio_set_path_tol(liscio_ctx_t *ctx, double tol_xyz, double tol_arcfit)
+{
+    if (!ctx) return;
+    if (tol_xyz < 0.0) tol_xyz = 0.0;
+    ctx->cfg.tol_xyz = tol_xyz;
+    if (tol_arcfit > 0.0)
+        ctx->cfg.tol_arcfit = tol_arcfit;
+    else
+        ctx->cfg.tol_arcfit = tol_xyz;
+    ctx->cfg.collinear_tol = tol_xyz;
+    if (ctx->cfg.tol_uvw <= 0.0)
+        ctx->cfg.tol_uvw = tol_xyz;
+    if (ctx->cfg.collapse_cusp_tol <= 0.0 ||
+        ctx->cfg.collapse_cusp_tol > tol_xyz)
+        ctx->cfg.collapse_cusp_tol = tol_xyz;
+    /* Mid-tight + flower-loose G64: G1-chain kills residual θ.  6.6.126
+     * fused_c2 |Δκ| samples did not touch flower Y=73.2 (P=0.05 was above
+     * the old 0.03 HI → g2_quintic κ=0 ends, 3.6° left on LINE seams).
+     * 6.6.136: LO 0.0025→0.001 so 1_1001/2_1001 same-dir leftover
+     * wraps can G1-chain (n_pts>=4).  Do not stack with g2_quintic
+     * (P=0.005 + both → SER-40 +203M). */
+    ctx->cfg.enable_g1_chain = (tol_xyz >= 0.001 && tol_xyz <= 0.05)
+                               && !getenv("TP2_NO_G1CHAIN");
+    /* Only looser than flower P=0.05.  TP2_G2ZERO forces on (A/B). */
+    ctx->cfg.enable_g2_quintic = !getenv("TP2_NO_G2ZERO")
+        && (getenv("TP2_G2ZERO") || (tol_xyz > 0.05));
 }

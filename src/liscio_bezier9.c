@@ -43,12 +43,26 @@
 #include "liscio_internal.h"
 
 #include <stdio.h>
+#include <stdlib.h>   /* getenv: TP2_G2DBG diagnostic */
 #include <math.h>
 #include <string.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* Fit-input densification capacity.  The fit acceptance gate (max_dev <=
+ * tol_xyz) samples the curve only AT the input points; a long straight
+ * segment inside a window contributes just 2 waypoints, so an unchecked
+ * bulge can grow inside its chord (3_1001 N4755 stay-down: 72 mm G1
+ * between scallop micro-lines → 17.7 mm phantom bulge, smooth and
+ * jerk-invisible).  densify_window() inserts collinear interior samples
+ * on over-long spans so BOTH the LSQ objective and the gate see the
+ * chord interior: the fit is then provably within tol everywhere (span
+ * shorter than 8·tol bulges at most ~(8·tol/3)·sin15° ≈ 0.69·tol by the
+ * control-polygon convex-hull bound, i.e. sub-tolerance even unsampled).
+ * Pure-micro windows (all spans < step) get zero added points. */
+#define LISCIO_FIT_DENSIFY_CAP 256
 
 /* Debug counters: G1 successes vs unconstrained fallbacks.  Compiled
  * in only with -DLISCIO_DEBUG_G1; tests print under env LISCIO_G1_STATS=1. */
@@ -179,6 +193,66 @@ static double hoschek_reparam(double p_x, double p_y, double p_z,
     return t_new;
 }
 
+/* Copy src[0..n-1] into dst, inserting evenly spaced collinear interior
+ * samples on every span whose chord exceeds
+ *     step = max(8·tol_xyz, total_chord / (cap − n))
+ * so the output never exceeds cap points and spans shorter than ~8·tol
+ * (geometrically incapable of hiding a >tol bulge) stay untouched.
+ * All 9 pose dims are linearly interpolated along the chord — exact
+ * ground truth for a G1 segment.  First/last dst points are bit-copies
+ * of the original endpoints (endpoint semantics unchanged for callers).
+ * Returns the new count, or -1 on defensive misuse (caller falls back
+ * to the original points). */
+static int densify_window(const liscio_pose_t *src, int n, double tol_xyz,
+                          liscio_pose_t *dst, int cap)
+{
+    if (!src || !dst || n < 2 || cap < n) return -1;
+
+    double total = 0.0;
+    for (int i = 1; i < n; i++) {
+        double dx = src[i].x - src[i-1].x;
+        double dy = src[i].y - src[i-1].y;
+        double dz = src[i].z - src[i-1].z;
+        total += sqrt(dx*dx + dy*dy + dz*dz);
+    }
+    if (total < 1e-12) {                 /* zero-XYZ (W-only) window */
+        for (int i = 0; i < n; i++) dst[i] = src[i];
+        return n;
+    }
+
+    double step = total / (double)(cap - n);
+    if (tol_xyz > 0.0 && 8.0 * tol_xyz > step) step = 8.0 * tol_xyz;
+
+    int out = 0;
+    dst[out++] = src[0];
+    for (int k = 0; k < n - 1; k++) {
+        const liscio_pose_t *a = &src[k];
+        const liscio_pose_t *b = &src[k + 1];
+        double dx = b->x - a->x, dy = b->y - a->y, dz = b->z - a->z;
+        double L = sqrt(dx*dx + dy*dy + dz*dz);
+        int m = (int)(L / step);         /* interior samples on this span */
+        if (m >= 1) {
+            double inv = 1.0 / (double)(m + 1);
+            for (int j = 1; j <= m; j++) {
+                double f = (double)j * inv;
+                liscio_pose_t p;
+                p.x = a->x + f * dx;
+                p.y = a->y + f * dy;
+                p.z = a->z + f * dz;
+                p.a = a->a + f * (b->a - a->a);
+                p.b = a->b + f * (b->b - a->b);
+                p.c = a->c + f * (b->c - a->c);
+                p.u = a->u + f * (b->u - a->u);
+                p.v = a->v + f * (b->v - a->v);
+                p.w = a->w + f * (b->w - a->w);
+                dst[out++] = p;
+            }
+        }
+        dst[out++] = *b;
+    }
+    return out;                          /* <= cap by construction of step */
+}
+
 /* ---------- Public entry ---------- */
 int liscio_bezier9_fit(const struct liscio_ctx *ctx, int i0, int i1,
                         liscio_bezier9_fit_t *out)
@@ -190,9 +264,16 @@ int liscio_bezier9_fit(const struct liscio_ctx *ctx, int i0, int i1,
 
     const liscio_pose_t *pts = &ctx->pts[i0];
 
+    /* Densify long spans so the LSQ and the tol gate see chord interiors
+     * (see LISCIO_FIT_DENSIFY_CAP above).  Fallback: original points. */
+    liscio_pose_t dpts[LISCIO_FIT_DENSIFY_CAP];
+    int dn = densify_window(pts, n, ctx->cfg.tol_xyz,
+                            dpts, LISCIO_FIT_DENSIFY_CAP);
+    if (dn >= n) { pts = dpts; n = dn; }
+
     /* Chord-length parameterization. */
-    double ts[LISCIO_MAX_WINDOW];
-    double cum_len[LISCIO_MAX_WINDOW];
+    double ts[LISCIO_FIT_DENSIFY_CAP];
+    double cum_len[LISCIO_FIT_DENSIFY_CAP];
     cum_len[0] = 0.0;
     for (int i = 1; i < n; i++) {
         double dx = pts[i].x - pts[i-1].x;
@@ -205,7 +286,7 @@ int liscio_bezier9_fit(const struct liscio_ctx *ctx, int i0, int i1,
     for (int i = 0; i < n; i++) ts[i] = cum_len[i] / total;
 
     /* Fit each of 9 dimensions independently with shared chord-length ts. */
-    double coords[9][LISCIO_MAX_WINDOW];
+    double coords[9][LISCIO_FIT_DENSIFY_CAP];
     double P0c[9], P3c[9], P1c[9], P2c[9];
     for (int i = 0; i < n; i++) {
         coords[0][i] = pts[i].x; coords[1][i] = pts[i].y; coords[2][i] = pts[i].z;
@@ -329,9 +410,17 @@ int liscio_bezier9_fit_g1(const struct liscio_ctx *ctx, int i0, int i1,
 
     const liscio_pose_t *pts = &ctx->pts[i0];
 
+    /* Densify long spans (see LISCIO_FIT_DENSIFY_CAP).  Endpoints are
+     * bit-copies of the originals, so the given G1 tangents keep their
+     * meaning.  Fallback: original points. */
+    liscio_pose_t dpts[LISCIO_FIT_DENSIFY_CAP];
+    int dn = densify_window(pts, n, ctx->cfg.tol_xyz,
+                            dpts, LISCIO_FIT_DENSIFY_CAP);
+    if (dn >= n) { pts = dpts; n = dn; }
+
     /* Chord-length parameterization. */
-    double ts[LISCIO_MAX_WINDOW];
-    double cum_len[LISCIO_MAX_WINDOW];
+    double ts[LISCIO_FIT_DENSIFY_CAP];
+    double cum_len[LISCIO_FIT_DENSIFY_CAP];
     cum_len[0] = 0.0;
     for (int i = 1; i < n; i++) {
         double dx = pts[i].x - pts[i-1].x;
@@ -345,7 +434,7 @@ int liscio_bezier9_fit_g1(const struct liscio_ctx *ctx, int i0, int i1,
 
     double P0x = pts[0].x,   P0y = pts[0].y,   P0z = pts[0].z;
     double P3x = pts[n-1].x, P3y = pts[n-1].y, P3z = pts[n-1].z;
-    double xs[LISCIO_MAX_WINDOW], ys[LISCIO_MAX_WINDOW], zs[LISCIO_MAX_WINDOW];
+    double xs[LISCIO_FIT_DENSIFY_CAP], ys[LISCIO_FIT_DENSIFY_CAP], zs[LISCIO_FIT_DENSIFY_CAP];
     for (int i = 0; i < n; i++) {
         xs[i] = pts[i].x; ys[i] = pts[i].y; zs[i] = pts[i].z;
     }
@@ -428,7 +517,7 @@ int liscio_bezier9_fit_g1(const struct liscio_ctx *ctx, int i0, int i1,
 
     /* ABC/UVW free per-axis fit with the refined ts. */
     double P1abc[6], P2abc[6];
-    double abc[6][LISCIO_MAX_WINDOW];
+    double abc[6][LISCIO_FIT_DENSIFY_CAP];
     for (int i = 0; i < n; i++) {
         abc[0][i] = pts[i].a; abc[1][i] = pts[i].b; abc[2][i] = pts[i].c;
         abc[3][i] = pts[i].u; abc[4][i] = pts[i].v; abc[5][i] = pts[i].w;
@@ -669,4 +758,417 @@ int liscio_bezier9_composite_fit_g1(const struct liscio_ctx *ctx,
     return fit_recursive(ctx, i0, i1,
                          t1x, t1y, t1z, t2x, t2y, t2z,
                          emit, user, 0);
+}
+
+/* ============================================================
+ *  Quintic G2 fit — endpoint curvature pinned to 0 (line seams)
+ * ============================================================
+ * Degree-5 Bézier whose first three / last three control points lie ON the
+ * start / end tangent lines, so κ(0)=κ(5)=0: the curve leaves and re-enters its
+ * neighbour straight segments with ZERO curvature → no centripetal-jerk step at
+ * the bezier↔line seam. Four scalar DOF (a,e along the start tangent; f,b along
+ * the end tangent) → a 4×4 linear least squares (the natural extension of the
+ * cubic G1 αL/αR fit). xyz carry the curvature; abc/uvw are interpolated linearly
+ * in the control polygon (exact for the constant/linear rotary the corpus uses).
+ * Emitted as a single-span clamped degree-5 B-spline. Returns 0 on success; -1 if
+ * a κ=0 quintic cannot meet tolerance (region genuinely curved at a seam → caller
+ * keeps the cubic, and the residual κ-step is handled by the normal-jerk cap). */
+static inline double Q50(double t){double u=1.0-t;return u*u*u*u*u;}
+static inline double Q51(double t){double u=1.0-t;return 5.0*t*u*u*u*u;}
+static inline double Q52(double t){double u=1.0-t;return 10.0*t*t*u*u*u;}
+static inline double Q53(double t){double u=1.0-t;return 10.0*t*t*t*u*u;}
+static inline double Q54(double t){double u=1.0-t;return 5.0*t*t*t*t*u;}
+static inline double Q55(double t){return t*t*t*t*t;}
+
+static int solve4x4(double A[4][4], double rhs[4], double x[4])
+{
+    for (int c = 0; c < 4; c++) {
+        int piv = c; double mx = fabs(A[c][c]);
+        for (int r = c+1; r < 4; r++) if (fabs(A[r][c]) > mx) { mx = fabs(A[r][c]); piv = r; }
+        if (mx < 1e-18) return -1;
+        if (piv != c) {
+            for (int k = 0; k < 4; k++) { double t = A[c][k]; A[c][k] = A[piv][k]; A[piv][k] = t; }
+            double t = rhs[c]; rhs[c] = rhs[piv]; rhs[piv] = t;
+        }
+        for (int r = c+1; r < 4; r++) {
+            double fct = A[r][c] / A[c][c];
+            for (int k = c; k < 4; k++) A[r][k] -= fct * A[c][k];
+            rhs[r] -= fct * rhs[c];
+        }
+    }
+    for (int r = 3; r >= 0; r--) {
+        double s = rhs[r];
+        for (int k = r+1; k < 4; k++) s -= A[r][k] * x[k];
+        x[r] = s / A[r][r];
+    }
+    return 0;
+}
+
+int liscio_quintic9_g2zero_fit(const struct liscio_ctx *ctx, int i0, int i1,
+    double t1x, double t1y, double t1z,
+    double t2x, double t2y, double t2z,
+    liscio_bspline9_fit_t *out)
+{
+    /* TODO(densify): same waypoint-only residual hole as the cubic
+     * fitters had — apply densify_window() here before enabling
+     * (env-gated OFF in TP2 production: enable_g2_quintic/curvature). */
+    if (!ctx || !out) return -1;
+    int n = i1 - i0 + 1;
+    if (n < 4 || n > LISCIO_MAX_WINDOW) return -1;
+    double m1 = sqrt(t1x*t1x+t1y*t1y+t1z*t1z), m2 = sqrt(t2x*t2x+t2y*t2y+t2z*t2z);
+    if (m1 < 1e-15 || m2 < 1e-15) return -1;
+    t1x/=m1; t1y/=m1; t1z/=m1;  t2x/=m2; t2y/=m2; t2z/=m2;
+
+    const liscio_pose_t *pts = &ctx->pts[i0];
+    double ts[LISCIO_MAX_WINDOW], cl[LISCIO_MAX_WINDOW]; cl[0] = 0.0;
+    for (int i = 1; i < n; i++) {
+        double dx=pts[i].x-pts[i-1].x, dy=pts[i].y-pts[i-1].y, dz=pts[i].z-pts[i-1].z;
+        cl[i] = cl[i-1] + sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    double total = cl[n-1]; if (total < 1e-12) return -1;
+    for (int i = 0; i < n; i++) ts[i] = cl[i]/total;
+
+    double P0x=pts[0].x,P0y=pts[0].y,P0z=pts[0].z;
+    double P5x=pts[n-1].x,P5y=pts[n-1].y,P5z=pts[n-1].z;
+
+    /* 4×4 normal equations for (a,e,f,b). */
+    double M[4][4] = {{0}}, rhs[4] = {0};
+    for (int i = 0; i < n; i++) {
+        double t=ts[i];
+        double b0=Q50(t),b1=Q51(t),b2=Q52(t),b3=Q53(t),b4=Q54(t),b5=Q55(t);
+        double cP0=b0+b1+b2, cP5=b3+b4+b5;
+        double rx=pts[i].x-cP0*P0x-cP5*P5x;
+        double ry=pts[i].y-cP0*P0y-cP5*P5y;
+        double rz=pts[i].z-cP0*P0z-cP5*P5z;
+        double co[4]={b1,b2,b3,b4};
+        double dx[4]={t1x,t1x,t2x,t2x}, dy[4]={t1y,t1y,t2y,t2y}, dz[4]={t1z,t1z,t2z,t2z};
+        for (int k=0;k<4;k++) {
+            double gkx=co[k]*dx[k], gky=co[k]*dy[k], gkz=co[k]*dz[k];
+            rhs[k]+=gkx*rx+gky*ry+gkz*rz;
+            for (int l=0;l<4;l++) {
+                double glx=co[l]*dx[l], gly=co[l]*dy[l], glz=co[l]*dz[l];
+                M[k][l]+=gkx*glx+gky*gly+gkz*glz;
+            }
+        }
+    }
+    double sol[4];
+    if (solve4x4(M, rhs, sol) != 0) return -1;
+    double a=sol[0], e=sol[1], f=sol[2], b=sol[3];
+    double eps = 1e-6 * total;
+    /* Control polygon must be FORWARD-MONOTONE on each tangent line: Q0→Q1→Q2 is
+     * 0<a<e and Q3→Q4→Q5 is f>b>0. A fold (e<a or b>f) places a control point
+     * behind its neighbour → a tiny in-tolerance wiggle but a huge spurious
+     * curvature spike (κ→hundreds). Reject → keep the cubic. Cap handles to the
+     * chord so a runaway LSQ solution can't balloon. */
+    if (a < eps || b < eps || e < a + eps || f < b + eps) return -1;
+    if (e > 0.9*total || f > 0.9*total) return -1;
+
+    double Qx[6]={P0x, P0x+a*t1x, P0x+e*t1x, P5x+f*t2x, P5x+b*t2x, P5x};
+    double Qy[6]={P0y, P0y+a*t1y, P0y+e*t1y, P5y+f*t2y, P5y+b*t2y, P5y};
+    double Qz[6]={P0z, P0z+a*t1z, P0z+e*t1z, P5z+f*t2z, P5z+b*t2z, P5z};
+
+    double maxdev=0;
+    for (int i=0;i<n;i++) {
+        double t=ts[i]; double bb[6]={Q50(t),Q51(t),Q52(t),Q53(t),Q54(t),Q55(t)};
+        double bx=0,by=0,bz=0;
+        for (int j=0;j<6;j++){bx+=bb[j]*Qx[j];by+=bb[j]*Qy[j];bz+=bb[j]*Qz[j];}
+        double dx=bx-pts[i].x,dy=by-pts[i].y,dz=bz-pts[i].z;
+        double d=sqrt(dx*dx+dy*dy+dz*dz); if(d>maxdev)maxdev=d;
+    }
+    if (maxdev > ctx->cfg.tol_xyz) return -1;
+
+    /* Interior-curvature guard: a monotone control polygon can still bend the
+     * MIDDLE (Q2→Q3 transition) into a near-loop — a small in-tolerance wiggle
+     * that spikes κ to hundreds and would blow joint accel/jerk in RT. Sample κ
+     * via the analytic 1st/2nd derivatives and reject if it exceeds a sane bound
+     * (real corpus curvature is ≲ a few /mm); the cubic then stands. */
+    {
+        double maxk = 0.0;
+        for (int s = 1; s < 64; s++) {
+            double t = s/64.0, u = 1.0-t;
+            /* B'(t), B''(t) of a quintic from control points (deg-4/deg-3 diffs). */
+            double d1[3], d2[3];
+            double Qc[3][6] = {{Qx[0],Qx[1],Qx[2],Qx[3],Qx[4],Qx[5]},
+                               {Qy[0],Qy[1],Qy[2],Qy[3],Qy[4],Qy[5]},
+                               {Qz[0],Qz[1],Qz[2],Qz[3],Qz[4],Qz[5]}};
+            /* deg-4 Bernstein for B', deg-3 for B'' */
+            double e4[5]={u*u*u*u, 4*t*u*u*u, 6*t*t*u*u, 4*t*t*t*u, t*t*t*t};
+            double e3[4]={u*u*u, 3*t*u*u, 3*t*t*u, t*t*t};
+            for (int c=0;c<3;c++){
+                double s1=0,s2=0;
+                for (int j=0;j<5;j++) s1 += e4[j]*5.0*(Qc[c][j+1]-Qc[c][j]);
+                for (int j=0;j<4;j++) s2 += e3[j]*20.0*(Qc[c][j+2]-2*Qc[c][j+1]+Qc[c][j]);
+                d1[c]=s1; d2[c]=s2;
+            }
+            double cx=d1[1]*d2[2]-d1[2]*d2[1], cy=d1[2]*d2[0]-d1[0]*d2[2], cz=d1[0]*d2[1]-d1[1]*d2[0];
+            double sp1=sqrt(d1[0]*d1[0]+d1[1]*d1[1]+d1[2]*d1[2]);
+            if (sp1 > 1e-9) {
+                double k = sqrt(cx*cx+cy*cy+cz*cz)/(sp1*sp1*sp1);
+                if (k > maxk) maxk = k;
+            }
+        }
+        if (maxk > 20.0) return -1;   /* fold/loop → keep the cubic */
+    }
+
+    /* abc/uvw: linear-in-polygon, verify tolerance. */
+    const double *sp=(const double*)&pts[0], *ep=(const double*)&pts[n-1];
+    double st_r[6], en_r[6];
+    for (int d=0;d<6;d++){ st_r[d]=sp[3+d]; en_r[d]=ep[3+d]; }
+    for (int i=0;i<n;i++){
+        double t=ts[i]; const double *pi=(const double*)&pts[i];
+        for (int d=0;d<6;d++){
+            double v=st_r[d]+(en_r[d]-st_r[d])*t;
+            double tol=(d<3)?ctx->cfg.tol_abc:ctx->cfg.tol_uvw;
+            if (fabs(v-pi[3+d])>tol) return -1;
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->degree = 5; out->n_ctrl = 6;
+    for (int j=0;j<6;j++){
+        double *cj=(double*)&out->ctrl[j];
+        cj[0]=Qx[j]; cj[1]=Qy[j]; cj[2]=Qz[j];
+        for (int d=0;d<6;d++) cj[3+d]=st_r[d]+(en_r[d]-st_r[d])*(j/5.0);
+        out->weights[j]=1.0;
+    }
+    for (int j=0;j<6;j++){ out->knots[j]=0.0; out->knots[6+j]=1.0; }
+    out->max_deviation = maxdev;
+    return 0;
+}
+
+/* ============================================================
+ *  Generalized quintic G2 fit — pins ARBITRARY endpoint curvature (κ≠0)  [MARK]
+ * ============================================================
+ * Brings the bezier9 curvature-matching (blend/bezier9.cc δ=5α²κ/4 normal
+ * offset) INTO liscio so fitted curves are C2 curvature-continuous at seams
+ * (each curve continues the neighbour's κ) instead of unbending to κ=0.  For an
+ * ARC run (subseg points) this recovers κ=1/R at the seams → no curvature step →
+ * no ripple → constant velocity → low jerk.  Endpoint κ + curve-normal are
+ * estimated from the first/last 3 points (osculating circle) so the fit is
+ * self-contained (arcs AND curved micro-line runs). */
+static double est_endpoint_kappa(const double pa[3], const double pb[3],
+                                 const double pc[3], double n[3])
+{
+    double ux=pb[0]-pa[0], uy=pb[1]-pa[1], uz=pb[2]-pa[2];
+    double vx=pc[0]-pa[0], vy=pc[1]-pa[1], vz=pc[2]-pa[2];
+    double cx=uy*vz-uz*vy, cy=uz*vx-ux*vz, cz=ux*vy-uy*vx;
+    double cm=sqrt(cx*cx+cy*cy+cz*cz);
+    double um=sqrt(ux*ux+uy*uy+uz*uz);
+    double vm=sqrt(vx*vx+vy*vy+vz*vz);
+    double wx=pc[0]-pb[0], wy=pc[1]-pb[1], wz=pc[2]-pb[2];
+    double wm=sqrt(wx*wx+wy*wy+wz*wz);
+    n[0]=n[1]=n[2]=0.0;
+    if (cm < 1e-18 || um < 1e-15 || vm < 1e-15 || wm < 1e-15) return 0.0;
+    /* Circumradius R = abc/(4A), A = triangle area = ½·cm (cm=|AB×AC|=2A).
+     * So κ = 1/R = 4A/(abc) = 2·cm/(abc).  (Prior code dropped the ×2 → κ/2,
+     * which under-bent the g2 quintic construction → mid-curve bulge →
+     * BULGE-reject on sharp arcs → bisect-to-native crawl.  See arc-chain
+     * G2 fusion.) */
+    double kappa = 2.0 * cm / (um * vm * wm);   /* κ = 1/R */
+    double uhx=ux/um, uhy=uy/um, uhz=uz/um;
+    double vdotu = vx*uhx+vy*uhy+vz*uhz;
+    double px=vx-vdotu*uhx, py=vy-vdotu*uhy, pz=vz-vdotu*uhz;
+    double pm=sqrt(px*px+py*py+pz*pz);
+    if (pm < 1e-15) return 0.0;
+    n[0]=px/pm; n[1]=py/pm; n[2]=pz/pm;
+    return kappa;
+}
+
+int liscio_quintic9_g2_fit(const struct liscio_ctx *ctx, int i0, int i1,
+    double t1x, double t1y, double t1z,
+    double t2x, double t2y, double t2z,
+    liscio_bspline9_fit_t *out)
+{
+    /* TODO(densify): same waypoint-only residual hole as the cubic
+     * fitters had — apply densify_window() here before enabling
+     * (env-gated OFF in TP2 production: enable_g2_quintic/curvature). */
+    if (!ctx || !out) return -1;
+    if (getenv("TP2_G2REJECT")) return -1;   /* diag: force-reject to isolate wedge */
+    int n = i1 - i0 + 1;
+    if (n < 4 || n > LISCIO_MAX_WINDOW) return -1;
+    double m1 = sqrt(t1x*t1x+t1y*t1y+t1z*t1z), m2 = sqrt(t2x*t2x+t2y*t2y+t2z*t2z);
+    if (m1 < 1e-15 || m2 < 1e-15) return -1;
+    t1x/=m1; t1y/=m1; t1z/=m1;  t2x/=m2; t2y/=m2; t2z/=m2;
+
+    const liscio_pose_t *pts = &ctx->pts[i0];
+    double ts[LISCIO_MAX_WINDOW], cl[LISCIO_MAX_WINDOW]; cl[0] = 0.0;
+    for (int i = 1; i < n; i++) {
+        double dx=pts[i].x-pts[i-1].x, dy=pts[i].y-pts[i-1].y, dz=pts[i].z-pts[i-1].z;
+        cl[i] = cl[i-1] + sqrt(dx*dx+dy*dy+dz*dz);
+    }
+    double total = cl[n-1]; if (total < 1e-12) return -1;
+    for (int i = 0; i < n; i++) ts[i] = cl[i]/total;
+
+    double P0x=pts[0].x,P0y=pts[0].y,P0z=pts[0].z;
+    double P5x=pts[n-1].x,P5y=pts[n-1].y,P5z=pts[n-1].z;
+
+    double ns[3], ne[3];
+    double pa0[3]={pts[0].x,pts[0].y,pts[0].z};
+    double pb0[3]={pts[1].x,pts[1].y,pts[1].z};
+    double pc0[3]={pts[2].x,pts[2].y,pts[2].z};
+    double k_start = est_endpoint_kappa(pa0, pb0, pc0, ns);
+    double pa1[3]={pts[n-1].x,pts[n-1].y,pts[n-1].z};
+    double pb1[3]={pts[n-2].x,pts[n-2].y,pts[n-2].z};
+    double pc1[3]={pts[n-3].x,pts[n-3].y,pts[n-3].z};
+    double k_end = est_endpoint_kappa(pa1, pb1, pc1, ne);
+
+    /* G2 CHAIN: if the previous emitted primitive was a curvature-matched
+     * quintic, PIN this fit's start curvature+normal to its end → the two
+     * curves share the seam curvature (C2), no κ step, no velocity hunting.
+     * Requires the G1 tangent chain too (G2 ⇒ G1); a corner/event that broke
+     * the tangent (have_prev_emit_tan=0) also breaks the G2 chain here, so the
+     * seam falls to a blend join instead — the user's "split where you can't
+     * hold G2, let the blend connect" design. */
+    if (ctx->have_prev_emit_kappa && ctx->have_prev_emit_tan) {
+        k_start = ctx->prev_emit_kappa;
+        ns[0] = ctx->prev_emit_norm_x;
+        ns[1] = ctx->prev_emit_norm_y;
+        ns[2] = ctx->prev_emit_norm_z;
+    }
+
+    double a, e, f, b;
+    if (getenv("TP2_G2LSQ")) {
+        /* Legacy facet+LSQ leg solve — DISPROVEN (bumps → jerk 94k/173k vs 81k
+         * native); kept for A/B only.  See git history / memory. */
+        double M[4][4] = {{0}}, rhs[4] = {0};
+        for (int i = 0; i < n; i++) {
+            double t=ts[i];
+            double b1=Q51(t),b2=Q52(t),b3=Q53(t),b4=Q54(t);
+            double b0=Q50(t),b5=Q55(t);
+            double cP0=b0+b1+b2, cP5=b3+b4+b5;
+            double rx=pts[i].x-cP0*P0x-cP5*P5x;
+            double ry=pts[i].y-cP0*P0y-cP5*P5y;
+            double rz=pts[i].z-cP0*P0z-cP5*P5z;
+            double co[4]={b1,b2,b3,b4};
+            double dx[4]={t1x,t1x,t2x,t2x}, dy[4]={t1y,t1y,t2y,t2y}, dz[4]={t1z,t1z,t2z,t2z};
+            for (int k=0;k<4;k++) {
+                double gkx=co[k]*dx[k], gky=co[k]*dy[k], gkz=co[k]*dz[k];
+                rhs[k]+=gkx*rx+gky*ry+gkz*rz;
+                for (int l=0;l<4;l++) {
+                    double glx=co[l]*dx[l], gly=co[l]*dy[l], glz=co[l]*dz[l];
+                    M[k][l]+=gkx*glx+gky*gly+gkz*glz;
+                }
+            }
+        }
+        double sol[4];
+        if (solve4x4(M, rhs, sol) != 0) return -1;
+        a=sol[0]; e=sol[1]; f=sol[2]; b=sol[3];
+    } else {
+        /* DIRECT construction (no LSQ, no facet noise): evenly-spaced control
+         * legs along the chord; the δ curvature offset (below) bends P2/P3 to
+         * the pinned endpoint κ.  Reconstructs a gentle arc / smooth curved run
+         * cleanly.  A run too bent for ONE quintic busts the deviation check
+         * below → return -1 → caller splits (composite) → blend joins the
+         * split.  This is the direct-geometry path the old LSQ note called for. */
+        a = 0.2 * total;  e = 0.4 * total;
+        b = 0.2 * total;  f = 0.4 * total;
+    }
+    double eps = 1e-6 * total;
+    if (a < eps || b < eps || e < a + eps || f < b + eps) return -1;
+    if (e > 0.9*total || f > 0.9*total) return -1;
+
+    double d0 = 1.25 * a * a * k_start;   /* Quintic δ = 5·a²·κ/4 */
+    double d1 = 1.25 * b * b * k_end;
+    double Qx[6]={P0x, P0x+a*t1x, P0x+e*t1x + d0*ns[0], P5x+f*t2x + d1*ne[0], P5x+b*t2x, P5x};
+    double Qy[6]={P0y, P0y+a*t1y, P0y+e*t1y + d0*ns[1], P5y+f*t2y + d1*ne[1], P5y+b*t2y, P5y};
+    double Qz[6]={P0z, P0z+a*t1z, P0z+e*t1z + d0*ns[2], P5z+f*t2z + d1*ne[2], P5z+b*t2z, P5z};
+
+    if (getenv("TP2_G2DBG")) {
+        static int c=0;
+        if (c++ < 40) { FILE*gf=fopen("/tmp/tp2_g2dbg.log","a");
+        if(gf){fprintf(gf,"g2fit n=%d tot=%.3f a=%.3f b=%.3f e=%.3f f=%.3f k0=%.4f k1=%.4f d0=%.4f d1=%.4f ns=(%.2f,%.2f,%.2f)\n",
+            n,total,a,b,e,f,k_start,k_end,d0,d1,ns[0],ns[1],ns[2]); fclose(gf);} }
+    }
+
+    double maxdev=0;
+    for (int i=0;i<n;i++) {
+        double t=ts[i]; double bb[6]={Q50(t),Q51(t),Q52(t),Q53(t),Q54(t),Q55(t)};
+        double bx=0,by=0,bz=0;
+        for (int j=0;j<6;j++){bx+=bb[j]*Qx[j];by+=bb[j]*Qy[j];bz+=bb[j]*Qz[j];}
+        double dx=bx-pts[i].x,dy=by-pts[i].y,dz=bz-pts[i].z;
+        double d=sqrt(dx*dx+dy*dy+dz*dz); if(d>maxdev)maxdev=d;
+    }
+    {
+        /* Reconstruction gate: tol_arcfit (fusion, decoupled from G64 P —
+         * P must never coarsen rebuilt arc geometry); fallback tol_xyz. */
+        double fit_tol = (ctx->cfg.tol_arcfit > 0.0)
+                         ? ctx->cfg.tol_arcfit : ctx->cfg.tol_xyz;
+        if (maxdev > fit_tol) return -1;
+    }
+
+    {
+        double maxk = 0.0;
+        for (int s = 1; s < 64; s++) {
+            double t = s/64.0, u = 1.0-t;
+            double d1v[3], d2v[3];
+            double Qc[3][6] = {{Qx[0],Qx[1],Qx[2],Qx[3],Qx[4],Qx[5]},
+                               {Qy[0],Qy[1],Qy[2],Qy[3],Qy[4],Qy[5]},
+                               {Qz[0],Qz[1],Qz[2],Qz[3],Qz[4],Qz[5]}};
+            double e4[5]={u*u*u*u, 4*t*u*u*u, 6*t*t*u*u, 4*t*t*t*u, t*t*t*t};
+            double e3[4]={u*u*u, 3*t*u*u, 3*t*t*u, t*t*t};
+            for (int c=0;c<3;c++){
+                double s1=0,s2=0;
+                for (int j=0;j<5;j++) s1 += e4[j]*5.0*(Qc[c][j+1]-Qc[c][j]);
+                for (int j=0;j<4;j++) s2 += e3[j]*20.0*(Qc[c][j+2]-2*Qc[c][j+1]+Qc[c][j]);
+                d1v[c]=s1; d2v[c]=s2;
+            }
+            double cx=d1v[1]*d2v[2]-d1v[2]*d2v[1], cy=d1v[2]*d2v[0]-d1v[0]*d2v[2], cz=d1v[0]*d2v[1]-d1v[1]*d2v[0];
+            double sp1=sqrt(d1v[0]*d1v[0]+d1v[1]*d1v[1]+d1v[2]*d1v[2]);
+            if (sp1 > 1e-9) {
+                double k = sqrt(cx*cx+cy*cy+cz*cz)/(sp1*sp1*sp1);
+                if (k > maxk) maxk = k;
+            }
+        }
+        if (maxk > 20.0) return -1;
+        /* BULGE REJECT: a curvature-matched fit of an ARC-like run (endpoints
+         * share a real curvature) should stay near that curvature.  A mid-curve
+         * bulge > BULGE_MAX × endpoint κ means one quintic cannot hold this span
+         * (thomam's ~150° arc window bulged maxk to 2.3× endpoint κ → the RT
+         * centripetal cap throttled it → 38s crawl).  Reject so the composite
+         * splitter makes SMALLER pieces (each a near-arc, no bulge), which the
+         * ctx κ-chain then stitches C2 → continuous curvature, no seam step.
+         * Only for arc-like runs (endpoint κ significant); low-κ gentle runs are
+         * exempt so we don't over-split them.  Tunable / off via env. */
+        {
+            double kref = fmax(k_start, k_end);
+            double bmax = getenv("TP2_G2BULGE") ? atof(getenv("TP2_G2BULGE")) : 1.4;
+            if (bmax > 1.0 && kref > 0.02 && maxk > bmax * kref) return -1;
+        }
+        /* 2026-09-05: G1 DROP REJECT (pinned k_start vs 8–15% avg < 0.5)
+         * → cubic/blend, 2_1001.sweep ±306k @ ~6 mm/s.  Do not reopen.
+         * 2026-09-05: G1 C2-split on that drop (keep quintic if split fails)
+         * → 2_1001.sweep ±1.34M @ Z=−42.53.  Do not reopen.
+         * 2026-09-05: one-TC Boehm-insert + snap Q[3] at the dump
+         * → take1 ±158k @ 70 mm/s same Z (FO-up), take2 pass was FO luck.
+         * Do not reopen. */
+    }
+
+    const double *sp=(const double*)&pts[0], *ep=(const double*)&pts[n-1];
+    double st_r[6], en_r[6];
+    for (int d=0;d<6;d++){ st_r[d]=sp[3+d]; en_r[d]=ep[3+d]; }
+    for (int i=0;i<n;i++){
+        double t=ts[i]; const double *pi=(const double*)&pts[i];
+        for (int d=0;d<6;d++){
+            double v=st_r[d]+(en_r[d]-st_r[d])*t;
+            double tol=(d<3)?ctx->cfg.tol_abc:ctx->cfg.tol_uvw;
+            if (fabs(v-pi[3+d])>tol) return -1;
+        }
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->degree = 5; out->n_ctrl = 6;
+    for (int j=0;j<6;j++){
+        double *cj=(double*)&out->ctrl[j];
+        cj[0]=Qx[j]; cj[1]=Qy[j]; cj[2]=Qz[j];
+        for (int d=0;d<6;d++) cj[3+d]=st_r[d]+(en_r[d]-st_r[d])*(j/5.0);
+        out->weights[j]=1.0;
+    }
+    for (int j=0;j<6;j++){ out->knots[j]=0.0; out->knots[6+j]=1.0; }
+    out->max_deviation = maxdev;
+    /* Publish end curvature+normal for the ctx G2 chain (next curve's k_start). */
+    out->end_kappa  = k_end;
+    out->end_norm_x = ne[0];
+    out->end_norm_y = ne[1];
+    out->end_norm_z = ne[2];
+    return 0;
 }
